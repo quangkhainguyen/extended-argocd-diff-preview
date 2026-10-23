@@ -1,0 +1,15 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ignore-array-order
+  namespace: argocd
+  annotations:
+    argocd-diff-preview/watch-pattern: "examples/ignore-array-order/.*"
+spec:
+  project: default
+  destination:
+    name: in-cluster
+    namespace: default
+  source:
+    repoURL: https://github.com/quangkhainguyen/extended-argocd-diff-preview
+    path: examples/ignore-array-order/manifests
