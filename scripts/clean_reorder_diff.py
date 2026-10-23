@@ -4,23 +4,39 @@
 argocd-diff-preview diffs the rendered YAML line by line, so reordering list
 entries (e.g. environment variables) shows up as a change. This script
 post-processes the generated `diff.md` and/or `diff.html` and removes those
-reorderings for lists stored under the given keys (default: env, volumes,
-volumeMounts).
+reorderings for the arrays selected by JSONPath expressions
+(default: `..env,..volumes,..volumeMounts`).
 
 How it works
 ------------
 The output only contains hunks of the diff (changed lines plus context). For
 every hunk the old text (context + removed lines) and the new text (context +
-added lines) are reconstructed. In both texts, every list under one of the keys
-is sorted (by `name` if available, otherwise by content). If both texts are equal
-afterwards, the hunk only contained reorderings and is removed. Otherwise the hunk
-is re-rendered so that only the real changes remain (the lists are shown sorted).
+added lines) are reconstructed. In both texts, every array matched by one of the
+JSONPaths is sorted (by `name` if available, otherwise by content). If both texts
+are equal afterwards, the hunk only contained reorderings and is removed.
+Otherwise the hunk is re-rendered so that only the real changes remain (shown in
+the order of the target branch).
 
-To never hide a real change, a list is only sorted when it is fully visible in
-the hunk: its key line (e.g. `env:`) and its end must be inside the hunk. Lists
+To never hide a real change, an array is only sorted when it is fully visible in
+the hunk: its key line (e.g. `env:`) and its end must be inside the hunk. Arrays
 that are cut off by a `@@ skipped ... @@` marker are left untouched. If reordered
-lists are long, run argocd-diff-preview with a bigger `--line-count` (e.g. 50)
+arrays are long, run argocd-diff-preview with a bigger `--line-count` (e.g. 50)
 and pass a smaller `--context` to this script to shrink the output again.
+
+JSONPath matching
+-----------------
+Supported syntax: `.field`, `..field` (any depth), `.*` (any field), `[*]`,
+`[n]`, `['field.with.dots']`, an optional leading `$` and kubectl-style `{...}`.
+The path must end with the field that holds the array, for example
+`.spec.template.spec.containers[*].env`.
+
+A hunk usually does not show the whole path of an array (e.g. `spec:` and
+`template:` are above the hunk). The visible part of the path must match
+exactly, the invisible part is assumed to match. The indentation is always
+checked, so `.spec.template.spec.containers[*].env` (Deployment) never matches
+`.spec.jobTemplate.spec.template.spec.containers[*].env` (CronJob). However, if
+e.g. the `containers:` line is not visible, `containers` and `initContainers`
+cannot be told apart. This can only hide a reordering, never a content change.
 
 Resources, applications and summary entries without remaining changes are
 removed and the `(+x|-y)` statistics are updated.
@@ -28,7 +44,8 @@ removed and the `(+x|-y)` statistics are updated.
 Usage
 -----
     python3 scripts/clean_reorder_diff.py output/diff.md output/diff.html
-    python3 scripts/clean_reorder_diff.py --keys env,volumes,volumeMounts,ports output/diff.md
+    python3 scripts/clean_reorder_diff.py \\
+        --paths '.spec.template.spec.containers[*].env,.spec.template.spec.volumes' output/diff.md
     python3 scripts/clean_reorder_diff.py --line-count 50 --context 5 output/diff.md
 
 Files are modified in place unless `--output` is given. The script needs the
@@ -48,7 +65,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-DEFAULT_KEYS = "env,volumes,volumeMounts"
+DEFAULT_PATHS = "..env,..volumes,..volumeMounts"
 
 # Lines argocd-diff-preview always ignores (see defaultIgnorePatterns in pkg/matching/output.go)
 DEFAULT_IGNORE_PREFIXES = (
@@ -71,6 +88,7 @@ DEFAULT_IGNORE_PREFIXES = (
 MARKER_RE = re.compile(r"^@@ skipped (\d+) lines(?: \((\d+) -> (\d+)\))? @@$")
 _KEY = r"(?P<key>\"[^\"]*\"|'[^']*'|[^\s:\"'#][^:]*?)"
 KEY_ONLY_RE = re.compile(r"^(?P<indent> *)(?P<dash>- )?" + _KEY + r":$")
+KEY_RE = re.compile(r"^(?P<indent> *)(?P<dash>- )?" + _KEY + r":(?:\s|$)")
 BLOCK_SCALAR_RE = re.compile(r"^(?P<indent> *)(?P<dash>- )?(?:" + _KEY + r":\s+)?[|>][-+0-9]*\s*$")
 ITEM_RE = re.compile(r"^( *)-(?: |$)")
 NAME_RE = re.compile(r"^name:\s+(.*?)\s*$")
@@ -87,9 +105,145 @@ HTML_ROW_RE = re.compile(r'^\t<tr class="\w+"><td><pre>(.*)</pre></td></tr>$')
 HTML_SKIPPED = "<p><em>Skipped</em></p>"
 
 
+# ---------------------------------------------------------------------------
+# JSONPath selection of arrays
+# ---------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class _Node:
+    """A visible YAML node on the path to an array: a mapping field or an array item."""
+
+    col: int
+    kind: str  # "field" | "item"
+    name: Optional[str] = None
+    index: Optional[int] = None  # position of an item, None if unknown
+    children: int = 0
+
+
+@dataclass(frozen=True)
+class _Token:
+    kind: str  # "field" | "index" | "any" (recursive descent)
+    name: Optional[str] = None  # None: any field
+    index: Optional[int] = None  # None: [*]
+
+
+@dataclass(frozen=True)
+class ArrayPath:
+    raw: str
+    tokens: tuple
+
+    def matches(self, chain: tuple) -> bool:
+        """Matches the visible path of an array (`chain`, root side first) from the end.
+
+        Nodes above the first visible node are unknown and assumed to match, as long
+        as the indentation of the visible nodes fits the depth given by the path.
+        """
+        tokens = self.tokens
+
+        def rec(vi: int, pi: int) -> bool:
+            if pi < 0:
+                return vi < 0
+            token = tokens[pi]
+            if token.kind == "any":
+                return rec(vi, pi - 1) or (vi >= 0 and rec(vi - 1, pi))
+            if vi < 0:
+                return True
+            node = chain[vi]
+            expected = _expected_col(tokens, pi)
+            if expected is not None and expected != node.col:
+                return False
+            if token.kind == "field":
+                if node.kind != "field" or (token.name is not None and token.name != node.name):
+                    return False
+            elif node.kind != "item" or (
+                token.index is not None and node.index is not None and token.index != node.index
+            ):
+                return False
+            return rec(vi - 1, pi - 1)
+
+        return rec(len(chain) - 1, len(tokens) - 1)
+
+
+def _expected_col(tokens: tuple, k: int) -> Optional[int]:
+    """Column of tokens[k] in the YAML written by argocd-diff-preview (sigs.k8s.io/yaml).
+
+    Nested fields are indented by 2, array items start at the column of their key
+    and the content of an item is indented by 2 ("- ").
+    """
+    if any(t.kind == "any" for t in tokens[: k + 1]):
+        return None
+    col = 0
+    for t in range(1, k + 1):
+        col += 0 if (tokens[t - 1].kind == "field" and tokens[t].kind == "index") else 2
+    return col
+
+
+def _read_name(p: str, start: int) -> tuple[str, int]:
+    end = start
+    while end < len(p) and p[end] not in ".[":
+        end += 1
+    return p[start:end].strip(), end
+
+
+def parse_path(raw: str) -> ArrayPath:
+    p = raw.strip()
+    if p.startswith("{") and p.endswith("}"):
+        p = p[1:-1].strip()
+    if p.startswith("$"):
+        p = p[1:]
+
+    def fail(msg: str) -> ArrayPath:
+        raise ValueError(f"invalid JSONPath {raw.strip()!r}: {msg}")
+
+    if not p:
+        return fail("path is empty")
+    if p[0] not in ".[":
+        p = "." + p
+
+    tokens: list[_Token] = []
+    i = 0
+    while i < len(p):
+        if p.startswith("..", i):
+            name, i = _read_name(p, i + 2)
+            if not name:
+                return fail("'..' must be followed by a field name")
+            tokens += [_Token("any"), _Token("field", None if name == "*" else name)]
+        elif p[i] == ".":
+            name, i = _read_name(p, i + 1)
+            if not name:
+                return fail(f"missing field name at position {i}")
+            tokens.append(_Token("field", None if name == "*" else name))
+        elif p[i] == "[":
+            end = p.find("]", i)
+            if end < 0:
+                return fail("unclosed '['")
+            content = p[i + 1 : end].strip()
+            i = end + 1
+            if content == "*":
+                tokens.append(_Token("index"))
+            elif len(content) >= 2 and content[0] in "'\"" and content[-1] == content[0]:
+                tokens.append(_Token("field", content[1:-1]))
+            elif content.isdigit():
+                tokens.append(_Token("index", index=int(content)))
+            else:
+                return fail(f"unsupported expression [{content}] (use [*], [n] or ['field'])")
+        else:
+            return fail(f"unexpected character {p[i]!r} at position {i}")
+
+    if tokens[-1].kind != "field":
+        return fail("the path must end with the field that holds the array, e.g. .spec.template.spec.containers[*].env")
+    return ArrayPath(raw.strip(), tuple(tokens))
+
+
+def parse_paths(s: str) -> list[ArrayPath]:
+    """Parses a comma or newline separated list of JSONPath expressions."""
+    return [parse_path(p) for p in re.split(r"[,\n]", s) if p.strip()]
+
+
 @dataclass
 class Config:
-    keys: set[str]
+    paths: list[ArrayPath]
     all_lists: bool = False
     line_count: int = 5
     context: int = 5
@@ -103,8 +257,10 @@ class Config:
         stripped = text.lstrip(" \t")
         return any(stripped.startswith(p) for p in DEFAULT_IGNORE_PREFIXES)
 
-    def sorts(self, key: str) -> bool:
-        return self.all_lists or key in self.keys
+    def sorts(self, chain: Optional[tuple]) -> bool:
+        if self.all_lists:
+            return True
+        return chain is not None and any(p.matches(chain) for p in self.paths)
 
 
 @dataclass
@@ -184,6 +340,42 @@ def _item_identity(name: Optional[str], item: list[str]) -> str:
 CANONICAL, COLLECT, FOLLOW = "canonical", "collect", "follow"
 
 
+def _structure(lines: list[str]) -> dict[int, tuple]:
+    """Returns the visible path (root side first) of every key line, keyed by line index."""
+    chains: dict[int, tuple] = {}
+    stack: list[_Node] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        dash = _item_indent(line)
+        m = KEY_RE.match(line)
+        if _is_blank(line) or (dash is None and m is None):
+            # Blank line or continuation of a multi-line value
+            i += 1
+            continue
+        if dash is not None:
+            while stack and (stack[-1].col > dash or (stack[-1].col == dash and stack[-1].kind == "item")):
+                stack.pop()
+            parent = stack[-1] if stack and stack[-1].kind == "field" and stack[-1].col in (dash, dash - 2) else None
+            index = None
+            if parent is not None:
+                index = parent.children
+                parent.children += 1
+            stack.append(_Node(dash, "item", index=index))
+        if m is not None:
+            col = len(m.group("indent")) + (2 if m.group("dash") else 0)
+            while stack and stack[-1].col >= col:
+                stack.pop()
+            stack.append(_Node(col, "field", name=_unquote(m.group("key"))))
+            chains[i] = tuple(stack)
+        threshold = _block_scalar_threshold(line)
+        i += 1
+        if threshold is not None:
+            while i < n and (_is_blank(lines[i]) or _indent(lines[i]) > threshold):
+                i += 1
+    return chains
+
+
 def normalize(
     lines: list[str],
     closed: bool,
@@ -192,18 +384,25 @@ def normalize(
     orders: Optional[dict] = None,
     path: tuple = (),
     counters: Optional[dict] = None,
+    chains: Optional[dict] = None,
+    offset: int = 0,
 ) -> list[str]:
-    """Walks all fully visible lists under the configured keys.
+    """Walks all fully visible arrays selected by the configured JSONPaths.
 
     mode CANONICAL sorts them, COLLECT records their item order into `orders`
-    and FOLLOW reorders them like the matching list recorded in `orders`.
+    and FOLLOW reorders them like the matching array recorded in `orders`.
 
     `closed` tells whether `lines` ends at a real structural boundary (end of
-    the document). If not, a list that runs until the last line may continue
+    the document). If not, an array that runs until the last line may continue
     outside the visible part and is therefore left alone.
+
+    `chains` holds the visible path of every key line of the top-level `lines`;
+    `offset` maps line indexes of nested calls back to the top level.
     """
     if counters is None:
         counters = {}
+    if chains is None:
+        chains = _structure(lines)
     out: list[str] = []
     i, n = 0, len(lines)
     while i < n:
@@ -240,11 +439,13 @@ def normalize(
                     raw = lines[j:k]
                     name = _item_name(raw, item_col)
                     item_path = list_path + ((name,) if name is not None else (len(items),))
-                    item = _normalize_item(raw, item_col, k < n or closed, cfg, mode, orders, item_path, counters)
+                    item = _normalize_item(
+                        raw, item_col, k < n or closed, cfg, mode, orders, item_path, counters, chains, offset + j
+                    )
                     items.append((name, item))
                     j = k
 
-                if (j < n or closed) and len(items) > 1 and cfg.sorts(key):
+                if (j < n or closed) and len(items) > 1 and cfg.sorts(chains.get(offset + i)):
                     if mode == CANONICAL:
                         items.sort(key=lambda it: _item_sort_key(it[1], item_col))
                     elif mode == COLLECT:
@@ -263,12 +464,21 @@ def normalize(
 
 
 def _normalize_item(
-    item: list[str], indent: int, closed: bool, cfg: Config, mode: str, orders, path: tuple, counters: dict
+    item: list[str],
+    indent: int,
+    closed: bool,
+    cfg: Config,
+    mode: str,
+    orders,
+    path: tuple,
+    counters: dict,
+    chains: dict,
+    offset: int,
 ) -> list[str]:
     first = item[0]
     # Turn "- key: value" into "  key: value" so the item content is parsed like a mapping
     as_mapping = first[:indent] + " " + first[indent + 1 :]
-    result = normalize([as_mapping] + item[1:], closed, cfg, mode, orders, path, counters)
+    result = normalize([as_mapping] + item[1:], closed, cfg, mode, orders, path, counters, chains, offset)
     result[0] = first
     return result
 
@@ -796,9 +1006,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("files", nargs="+", help="diff.md and/or diff.html files to clean (modified in place)")
     parser.add_argument(
-        "--keys",
-        default=DEFAULT_KEYS,
-        help=f"Comma-separated keys whose list order is ignored, at any depth (default: {DEFAULT_KEYS})",
+        "--paths",
+        default=DEFAULT_PATHS,
+        help="Comma or newline separated JSONPaths of arrays whose element order is ignored, "
+        f"e.g. '.spec.template.spec.containers[*].env' (default: {DEFAULT_PATHS})",
     )
     parser.add_argument(
         "--all-lists",
@@ -833,6 +1044,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.output and len(args.files) != 1:
         parser.error("--output can only be used with a single input file")
 
+    try:
+        paths = parse_paths(args.paths)
+    except ValueError as e:
+        parser.error(f"--paths: {e}")
+
     ignore_regex = None
     if args.diff_ignore:
         try:
@@ -841,7 +1057,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             ignore_regex = re.compile(re.escape(args.diff_ignore))
 
     cfg = Config(
-        keys={k.strip() for k in args.keys.split(",") if k.strip()},
+        paths=paths,
         all_lists=args.all_lists,
         line_count=args.line_count,
         context=args.context if args.context is not None else args.line_count,

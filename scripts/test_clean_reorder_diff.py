@@ -10,9 +10,9 @@ TESTDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata")
 STATS = "_Stats_:\n[Applications: 2], [Full Run: Xs], [Rendering: Xs], [Cluster: Xs], [Argo CD: Xs]"
 
 
-def cfg(keys=c.DEFAULT_KEYS, line_count=5, context=None, **kwargs) -> c.Config:
+def cfg(paths=c.DEFAULT_PATHS, line_count=5, context=None, **kwargs) -> c.Config:
     return c.Config(
-        keys=set(keys.split(",")),
+        paths=c.parse_paths(paths),
         line_count=line_count,
         context=line_count if context is None else context,
         **kwargs,
@@ -209,7 +209,7 @@ class ProcessDocumentTest(unittest.TestCase):
         text = md("Modified (1):\n± app (+1|-1)", section("app", resource("Deployment: default/app", content)))
         self.assertEqual(text, self.run_doc(text, cfg()))
 
-    def test_keys_are_respected(self):
+    def test_paths_are_respected(self):
         content = diff(
             "         ports:",
             "-        - containerPort: 80",
@@ -219,7 +219,7 @@ class ProcessDocumentTest(unittest.TestCase):
         )
         text = md("Modified (1):\n± app (+1|-1)", section("app", resource("Deployment: default/app", content)))
         self.assertEqual(text, self.run_doc(text, cfg()))
-        self.assertEqual(md("No changes found"), self.run_doc(text, cfg(keys="ports")))
+        self.assertEqual(md("No changes found"), self.run_doc(text, cfg(paths="..ports")))
         self.assertEqual(md("No changes found"), self.run_doc(text, cfg(all_lists=True)))
 
     def test_dropped_hunk_merges_skip_markers(self):
@@ -361,7 +361,121 @@ class ProcessDocumentTest(unittest.TestCase):
         )
 
 
+class JsonPathTest(unittest.TestCase):
+    DEPLOYMENT_ENV = ".spec.template.spec.containers[*].env"
+
+    def assert_cleaned(self, paths: str, content: str, cleaned: bool):
+        text = md("Modified (1):\n± app (+2|-2)", section("app", resource("Deployment: default/app", content)))
+        result, _ = c.process_document(text, cfg(paths=paths))
+        self.assertEqual(md("No changes found") if cleaned else text, result, paths)
+
+    def test_full_path_matches_when_upper_part_is_not_visible(self):
+        # ENV_REORDER starts at "spec:" of the pod template; .spec.template is above the hunk
+        for path in (
+            self.DEPLOYMENT_ENV,
+            "$.spec.template.spec.containers[*].env",
+            "{.spec.template.spec.containers[*].env}",
+            "spec.template.spec.containers[*].env",
+            ".spec.template.spec.containers[0].env",
+            ".spec.template.spec.*[*].env",
+            "..containers[*].env",
+            "..env",
+        ):
+            self.assert_cleaned(path, ENV_REORDER, cleaned=True)
+
+    def test_visible_part_of_path_must_match(self):
+        for path in (
+            ".spec.template.spec.initContainers[*].env",  # containers: is visible
+            ".spec.template.spec.containers[1].env",  # it is the first container
+            ".spec.template.spec.containers[*].envFrom",
+            "..initContainers[*].env",
+        ):
+            self.assert_cleaned(path, ENV_REORDER, cleaned=False)
+
+    def test_depth_must_match(self):
+        for path in (
+            ".spec.jobTemplate.spec.template.spec.containers[*].env",  # CronJob
+            ".spec.containers[*].env",  # Pod
+        ):
+            self.assert_cleaned(path, ENV_REORDER, cleaned=False)
+
+    def test_invisible_ancestors_are_assumed_to_match(self):
+        # The hunk starts inside a container, so containers/initContainers can't be told apart
+        content = diff(
+            "         image: nginx",
+            "         env:",
+            "-        - name: A",
+            "         - name: B",
+            "+        - name: A",
+            "         name: app",
+        )
+        self.assert_cleaned(self.DEPLOYMENT_ENV, content, cleaned=True)
+        self.assert_cleaned(".spec.template.spec.initContainers[*].env", content, cleaned=True)
+        self.assert_cleaned(".spec.containers[*].env", content, cleaned=False)
+
+    def test_pod_and_cronjob_paths(self):
+        pod = diff(
+            " spec:",
+            "   containers:",
+            "   - env:",
+            "-    - name: A",
+            "     - name: B",
+            "+    - name: A",
+            "     name: app",
+        )
+        self.assert_cleaned(".spec.containers[*].env", pod, cleaned=True)
+        self.assert_cleaned(self.DEPLOYMENT_ENV, pod, cleaned=False)
+
+        cronjob = diff(
+            " " + " " * 8 + "spec:",
+            " " + " " * 10 + "containers:",
+            " " + " " * 10 + "- env:",
+            "-" + " " * 12 + "- name: A",
+            " " + " " * 12 + "- name: B",
+            "+" + " " * 12 + "- name: A",
+            " " + " " * 12 + "name: app",
+        )
+        self.assert_cleaned(".spec.jobTemplate.spec.template.spec.containers[*].env", cronjob, cleaned=True)
+        self.assert_cleaned(self.DEPLOYMENT_ENV, cronjob, cleaned=False)
+
+    def test_volumes_path(self):
+        content = diff(
+            "       volumes:",
+            "       - emptyDir: {}",
+            "-        name: config",
+            "-      - emptyDir: {}",
+            "         name: cache",
+            "+      - emptyDir: {}",
+            "+        name: config",
+        )
+        self.assert_cleaned(".spec.template.spec.volumes", content, cleaned=True)
+        self.assert_cleaned(".spec.volumes", content, cleaned=False)
+        self.assert_cleaned(".spec.template.spec.containers[*].volumes", content, cleaned=False)
+
+    def test_parse_errors(self):
+        for path, error in (
+            ("", "path is empty"),
+            (".spec.containers[*", "unclosed"),
+            (".spec.containers[?(@.name=='a')].env", "unsupported expression"),
+            (".spec..", "must be followed by a field name"),
+            (".spec.[*]", "missing field name"),
+            (".spec.containers[*]", "must end with the field"),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                c.parse_path(path)
+            self.assertIn(error, str(ctx.exception), path)
+
+    def test_parse_paths_list(self):
+        paths = c.parse_paths(".a.b,\n ..env \n,$.c[0].d")
+        self.assertEqual([".a.b", "..env", "$.c[0].d"], [p.raw for p in paths])
+
+
 class CliTest(unittest.TestCase):
+    def test_invalid_path_is_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            c.main(["--paths", ".spec[?(@.x)].env", "diff.md"])
+        self.assertEqual(2, ctx.exception.code)
+
     def test_in_place_and_output(self):
         import tempfile
 
