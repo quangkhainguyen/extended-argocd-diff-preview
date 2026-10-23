@@ -16,22 +16,22 @@ spec:
         - name: app
           image: nginx:1.27
           args:
-            - --first
             - --second
+            - --first
           env:
+            - name: DB_PORT
+              value: "5433"
             - name: LOG_LEVEL
               value: info
             - name: DB_HOST
               value: postgres
-            - name: DB_PORT
-              value: "5432"
           volumeMounts:
             - name: config
               mountPath: /etc/config
             - name: cache
               mountPath: /var/cache
       volumes:
-        - name: config
-          emptyDir: {}
         - name: cache
+          emptyDir: {}
+        - name: config
           emptyDir: {}
