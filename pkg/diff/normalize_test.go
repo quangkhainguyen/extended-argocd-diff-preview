@@ -33,6 +33,25 @@ spec:
 	return unstructured.Unstructured{Object: obj}
 }
 
+func deploymentWithVolumes(name string, volumes []any) unstructured.Unstructured {
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": "default",
+		},
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{map[string]any{"name": "app", "image": "nginx"}},
+					"volumes":    volumes,
+				},
+			},
+		},
+	}}
+}
+
 func envNames(t *testing.T, m unstructured.Unstructured) []string {
 	t.Helper()
 	containers, _, err := unstructured.NestedSlice(m.Object, "spec", "template", "spec", "containers")
@@ -109,4 +128,92 @@ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
 	require.Len(t, diffs[0].Resources, 1)
 	assert.Contains(t, diffs[0].Resources[0].Content, `-          value: "2"`)
 	assert.Contains(t, diffs[0].Resources[0].Content, `+          value: "3"`)
+}
+
+func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
+	rules, err := arrayorder.FromString(
+		".spec.template.spec.volumes,.spec.template.spec.volumes[*].projected.sources",
+	)
+	require.NoError(t, err)
+
+	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
+	roleConfig := map[string]any{
+		"name": "role-config-volume",
+		"configMap": map[string]any{"name": "default-role-config-cm"},
+	}
+	tokens := map[string]any{
+		"name": "tokens",
+		"projected": map[string]any{
+			"defaultMode": int64(420),
+			"sources": []any{map[string]any{
+				"serviceAccountToken": map[string]any{
+					"audience":          "api://AzureADTokenExchange",
+					"expirationSeconds": int64(3600),
+					"path":              "azure-identity-token",
+				},
+			}},
+		},
+	}
+
+	baseApps := []extract.ExtractedApp{{
+		Id: "app", Name: "app", SourcePath: "apps/app.yaml", Branch: git.Base,
+		Manifests: []unstructured.Unstructured{
+			deploymentWithVolumes("app-a", []any{diagnostics, roleConfig, tokens}),
+			deploymentWithVolumes("app-b", []any{roleConfig, diagnostics, tokens}),
+		},
+	}}
+	targetApps := []extract.ExtractedApp{{
+		Id: "app", Name: "app", SourcePath: "apps/app.yaml", Branch: git.Target,
+		Manifests: []unstructured.Unstructured{
+			deploymentWithVolumes("app-a", []any{tokens, diagnostics, roleConfig}),
+			deploymentWithVolumes("app-b", []any{diagnostics, tokens, roleConfig}),
+		},
+	}}
+
+	diffs, err := matching.GenerateAppDiffs(
+		sortArraysInApps(baseApps, rules),
+		sortArraysInApps(targetApps, rules),
+		3, nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, diffs)
+}
+
+func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testing.T) {
+	rules, err := arrayorder.FromString(".spec.template.spec.volumes")
+	require.NoError(t, err)
+
+	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
+	roleConfig := map[string]any{
+		"name":     "role-config-volume",
+		"configMap": map[string]any{"name": "default-role-config-cm"},
+	}
+	projectedToken := func(name string) map[string]any {
+		return map[string]any{
+			"name": name,
+			"projected": map[string]any{
+				"defaultMode": int64(420),
+				"sources": []any{map[string]any{
+					"serviceAccountToken": map[string]any{
+						"audience":          "api://AzureADTokenExchange",
+						"expirationSeconds": int64(3600),
+						"path":              "azure-identity-token",
+					},
+				}},
+			},
+		}
+	}
+
+	base := deploymentWithVolumes("app", []any{diagnostics, roleConfig, projectedToken("tokens")})
+	target := deploymentWithVolumes("app", []any{projectedToken("azure-identity-token"), diagnostics, roleConfig})
+	diffs, err := matching.GenerateAppDiffsWithArrayOrder(
+		sortArraysInApps(newApps(base, git.Base), rules),
+		sortArraysInApps(newApps(target, git.Target), rules),
+		3, nil, nil, rules,
+	)
+	require.NoError(t, err)
+	require.Len(t, diffs, 1)
+	require.Len(t, diffs[0].Resources, 1)
+	assert.Equal(t, 1, diffs[0].Resources[0].DeletedLines, diffs[0].Resources[0].Content)
+	assert.Equal(t, 1, diffs[0].Resources[0].AddedLines, diffs[0].Resources[0].Content)
 }

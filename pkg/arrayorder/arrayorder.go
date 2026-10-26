@@ -146,6 +146,152 @@ func Apply(obj map[string]any, rules []Rule) {
 	}
 }
 
+// Align places identical elements of matched arrays in the same order on both
+// objects, leaving unmatched elements after them for a clearer resource diff.
+func Align(base, target map[string]any, rules []Rule) {
+	for _, rule := range rules {
+		align(base, target, rule.segments)
+	}
+}
+
+func align(base, target any, segments []segment) {
+	if len(segments) == 0 {
+		baseList, baseOK := base.([]any)
+		targetList, targetOK := target.([]any)
+		if baseOK && targetOK {
+			alignLists(baseList, targetList)
+		}
+		return
+	}
+
+	seg, rest := segments[0], segments[1:]
+	switch seg.kind {
+	case segField:
+		baseMap, baseOK := base.(map[string]any)
+		targetMap, targetOK := target.(map[string]any)
+		if !baseOK || !targetOK {
+			return
+		}
+		baseChild, baseOK := baseMap[seg.name]
+		targetChild, targetOK := targetMap[seg.name]
+		if baseOK && targetOK {
+			align(baseChild, targetChild, rest)
+		}
+	case segIndex:
+		baseList, baseOK := base.([]any)
+		targetList, targetOK := target.([]any)
+		if baseOK && targetOK && seg.index < len(baseList) && seg.index < len(targetList) {
+			align(baseList[seg.index], targetList[seg.index], rest)
+		}
+	case segWildcard:
+		switch baseValue := base.(type) {
+		case map[string]any:
+			targetValue, ok := target.(map[string]any)
+			if !ok {
+				return
+			}
+			for key, baseChild := range baseValue {
+				if targetChild, exists := targetValue[key]; exists {
+					align(baseChild, targetChild, rest)
+				}
+			}
+		case []any:
+			targetValue, ok := target.([]any)
+			if !ok {
+				return
+			}
+			for i := 0; i < len(baseValue) && i < len(targetValue); i++ {
+				align(baseValue[i], targetValue[i], rest)
+			}
+		}
+	case segRecursive:
+		alignRecursive(base, target, seg.name, rest)
+	}
+}
+
+func alignRecursive(base, target any, name string, rest []segment) {
+	switch baseValue := base.(type) {
+	case map[string]any:
+		targetValue, ok := target.(map[string]any)
+		if !ok {
+			return
+		}
+		if baseChild, exists := baseValue[name]; exists {
+			if targetChild, targetExists := targetValue[name]; targetExists {
+				align(baseChild, targetChild, rest)
+			}
+		}
+		for key, baseChild := range baseValue {
+			if targetChild, exists := targetValue[key]; exists {
+				alignRecursive(baseChild, targetChild, name, rest)
+			}
+		}
+	case []any:
+		targetValue, ok := target.([]any)
+		if !ok {
+			return
+		}
+		for i := 0; i < len(baseValue) && i < len(targetValue); i++ {
+			alignRecursive(baseValue[i], targetValue[i], name, rest)
+		}
+	}
+}
+
+func alignLists(base, target []any) {
+	baseGroups := groupByCanonicalKey(base)
+	targetGroups := groupByCanonicalKey(target)
+	if baseGroups == nil || targetGroups == nil {
+		return
+	}
+
+	commonCounts := make(map[string]int)
+	keys := make([]string, 0, len(baseGroups))
+	for key, baseItems := range baseGroups {
+		if targetItems := targetGroups[key]; len(targetItems) > 0 {
+			commonCounts[key] = min(len(baseItems), len(targetItems))
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	baseOrder := orderedByGroups(baseGroups, commonCounts, keys)
+	targetOrder := orderedByGroups(targetGroups, commonCounts, keys)
+	copy(base, baseOrder)
+	copy(target, targetOrder)
+}
+
+func groupByCanonicalKey(list []any) map[string][]any {
+	groups := make(map[string][]any, len(list))
+	for _, item := range list {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil
+		}
+		key := string(encoded)
+		groups[key] = append(groups[key], item)
+	}
+	return groups
+}
+
+func orderedByGroups(groups map[string][]any, commonCounts map[string]int, commonKeys []string) []any {
+	ordered := make([]any, 0)
+	for _, key := range commonKeys {
+		ordered = append(ordered, groups[key][:commonCounts[key]]...)
+	}
+
+	var unmatchedKeys []string
+	for key, items := range groups {
+		if len(items) > commonCounts[key] {
+			unmatchedKeys = append(unmatchedKeys, key)
+		}
+	}
+	sort.Strings(unmatchedKeys)
+	for _, key := range unmatchedKeys {
+		ordered = append(ordered, groups[key][commonCounts[key]:]...)
+	}
+	return ordered
+}
+
 func apply(node any, segments []segment) {
 	if len(segments) == 0 {
 		if list, ok := node.([]any); ok {
