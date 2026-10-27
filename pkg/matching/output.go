@@ -169,17 +169,6 @@ func GenerateAppDiffs(
 	contextLines uint,
 	ignorePattern *string,
 	ignoreResourceRules []resource_filter.IgnoreResourceRule,
-) ([]AppDiff, error) {
-	return GenerateAppDiffsWithArrayOrder(baseApps, targetApps, contextLines, ignorePattern, ignoreResourceRules, nil)
-}
-
-// GenerateAppDiffsWithArrayOrder generates diffs and aligns selected arrays in
-// matched resources so unchanged elements remain stable in the rendered diff.
-func GenerateAppDiffsWithArrayOrder(
-	baseApps, targetApps []extract.ExtractedApp,
-	contextLines uint,
-	ignorePattern *string,
-	ignoreResourceRules []resource_filter.IgnoreResourceRule,
 	ignoreArrayOrder []arrayorder.Rule,
 ) ([]AppDiff, error) {
 	// Compile the ignore pattern regex once up front

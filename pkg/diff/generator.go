@@ -53,7 +53,7 @@ func GeneratePreview(
 	}
 
 	// Generate diffs using the matching package
-	appDiffs, err := matching.GenerateAppDiffsWithArrayOrder(baseManifests, targetManifests, lineCount, diffIgnoreRegex, ignoreResourceRules, ignoreArrayOrder)
+	appDiffs, err := matching.GenerateAppDiffs(baseManifests, targetManifests, lineCount, diffIgnoreRegex, ignoreResourceRules, ignoreArrayOrder)
 	if err != nil {
 		return time.Since(startTime), fmt.Errorf("failed to generate matching diffs: %w", err)
 	}

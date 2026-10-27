@@ -106,7 +106,7 @@ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
 `)
 
 	// Without rules, a pure reorder produces a diff
-	diffs, err := matching.GenerateAppDiffs(newApps(base, git.Base), newApps(reordered, git.Target), 3, nil, nil)
+	diffs, err := matching.GenerateAppDiffs(newApps(base, git.Base), newApps(reordered, git.Target), 3, nil, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, diffs, 1)
 
@@ -114,7 +114,7 @@ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
 	diffs, err = matching.GenerateAppDiffs(
 		sortArraysInApps(newApps(base, git.Base), rules),
 		sortArraysInApps(newApps(reordered, git.Target), rules),
-		3, nil, nil)
+		3, nil, nil, nil)
 	require.NoError(t, err)
 	assert.Empty(t, diffs)
 
@@ -122,7 +122,7 @@ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
 	diffs, err = matching.GenerateAppDiffs(
 		sortArraysInApps(newApps(base, git.Base), rules),
 		sortArraysInApps(newApps(changed, git.Target), rules),
-		3, nil, nil)
+		3, nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, diffs, 1)
 	require.Len(t, diffs[0].Resources, 1)
@@ -173,7 +173,7 @@ func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
 	diffs, err := matching.GenerateAppDiffs(
 		sortArraysInApps(baseApps, rules),
 		sortArraysInApps(targetApps, rules),
-		3, nil, nil,
+		3, nil, nil, nil,
 	)
 	require.NoError(t, err)
 	assert.Empty(t, diffs)
@@ -206,7 +206,7 @@ func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testi
 
 	base := deploymentWithVolumes("app", []any{diagnostics, roleConfig, projectedToken("tokens")})
 	target := deploymentWithVolumes("app", []any{projectedToken("azure-identity-token"), diagnostics, roleConfig})
-	diffs, err := matching.GenerateAppDiffsWithArrayOrder(
+	diffs, err := matching.GenerateAppDiffs(
 		sortArraysInApps(newApps(base, git.Base), rules),
 		sortArraysInApps(newApps(target, git.Target), rules),
 		3, nil, nil, rules,
