@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
@@ -216,4 +217,43 @@ func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testi
 	require.Len(t, diffs[0].Resources, 1)
 	assert.Equal(t, 1, diffs[0].Resources[0].DeletedLines, diffs[0].Resources[0].Content)
 	assert.Equal(t, 1, diffs[0].Resources[0].AddedLines, diffs[0].Resources[0].Content)
+}
+
+func TestIgnoreArrayOrder_ChangedEnvValueStaysAtSortedPosition(t *testing.T) {
+	rules, err := arrayorder.FromString(".spec.template.spec.containers[*].env")
+	require.NoError(t, err)
+
+	base := deploymentWithEnv(t, `
+        - name: LOG_LEVEL
+          value: info
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_HOST
+          value: postgres
+`)
+	target := deploymentWithEnv(t, `
+        - name: DB_HOST
+          value: postgres
+        - name: LOG_LEVEL
+          value: info
+        - name: DB_PORT
+          value: "5433"
+`)
+
+	diffs, err := matching.GenerateAppDiffs(
+		sortArraysInApps(newApps(base, git.Base), rules),
+		sortArraysInApps(newApps(target, git.Target), rules),
+		10, nil, nil, rules,
+	)
+	require.NoError(t, err)
+	require.Len(t, diffs, 1)
+	require.Len(t, diffs[0].Resources, 1)
+
+	content := diffs[0].Resources[0].Content
+	assert.Equal(t, 1, diffs[0].Resources[0].AddedLines, content)
+	assert.Equal(t, 1, diffs[0].Resources[0].DeletedLines, content)
+	assert.Contains(t, content, "-          value: \"5432\"")
+	assert.Contains(t, content, "+          value: \"5433\"")
+	assert.Less(t, strings.Index(content, "name: DB_HOST"), strings.Index(content, "name: DB_PORT"), content)
+	assert.Less(t, strings.Index(content, "name: DB_PORT"), strings.Index(content, "name: LOG_LEVEL"), content)
 }

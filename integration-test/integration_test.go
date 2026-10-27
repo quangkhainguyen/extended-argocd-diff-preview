@@ -443,9 +443,6 @@ var testCases = []TestCase{
 	},
 }
 
-// effectiveRenderMethod returns the render mode that should be used for a test case.
-// tc.RenderMethod takes highest precedence, then the global -render-method flag.
-// Returns "" when the tool should use its own default (server-api).
 // gitHubRepo returns the "owner/repo" the test branches are cloned from.
 func gitHubRepo(tc TestCase) string {
 	if tc.GitHubRepo != "" {
@@ -454,6 +451,9 @@ func gitHubRepo(tc TestCase) string {
 	return fmt.Sprintf("%s/%s", defaultGitHubOrg, defaultGitOpsRepo)
 }
 
+// effectiveRenderMethod returns the render mode that should be used for a test case.
+// tc.RenderMethod takes highest precedence, then the global -render-method flag.
+// Returns "" when the tool should use its own default (server-api).
 func effectiveRenderMethod(tc TestCase) string {
 	if tc.RenderMethod != "" {
 		return tc.RenderMethod

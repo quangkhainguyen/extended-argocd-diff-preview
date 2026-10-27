@@ -261,7 +261,7 @@ func generateAppDiff(pair Pair, contextLines uint, ignorePattern *regexp.Regexp,
 	}
 
 	// Build per-resource diffs
-	resources, added, deleted, err := buildResourceDiffsWithArrayOrder(changedResources, contextLines, ignorePattern, ignoreResourceRules, ignoreArrayOrder)
+	resources, added, deleted, err := buildResourceDiffs(changedResources, contextLines, ignorePattern, ignoreResourceRules, ignoreArrayOrder)
 	if err != nil {
 		return diff, err
 	}
@@ -281,15 +281,6 @@ func generateAppDiff(pair Pair, contextLines uint, ignorePattern *regexp.Regexp,
 
 // buildResourceDiffs generates per-resource diffs for all changed resources in an app
 func buildResourceDiffs(
-	resources []ResourcePair,
-	contextLines uint,
-	ignorePattern *regexp.Regexp,
-	ignoreResourceRules []resource_filter.IgnoreResourceRule,
-) ([]ResourceDiff, int, int, error) {
-	return buildResourceDiffsWithArrayOrder(resources, contextLines, ignorePattern, ignoreResourceRules, nil)
-}
-
-func buildResourceDiffsWithArrayOrder(
 	resources []ResourcePair,
 	contextLines uint,
 	ignorePattern *regexp.Regexp,

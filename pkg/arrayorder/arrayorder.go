@@ -256,59 +256,93 @@ func alignRecursive(base, target any, name string, rest []segment) {
 	}
 }
 
+// alignLists pairs identical elements first, then elements sharing a "name", and puts
+// each pair at the same position in both lists. Unpaired elements follow in their original order.
 func alignLists(base, target []any) {
-	baseGroups := groupByCanonicalKey(base)
-	targetGroups := groupByCanonicalKey(target)
-	if baseGroups == nil || targetGroups == nil {
+	baseKeys, ok := jsonKeys(base)
+	if !ok {
+		return
+	}
+	targetKeys, ok := jsonKeys(target)
+	if !ok {
 		return
 	}
 
-	commonCounts := make(map[string]int)
-	keys := make([]string, 0, len(baseGroups))
-	for key, baseItems := range baseGroups {
-		if targetItems := targetGroups[key]; len(targetItems) > 0 {
-			commonCounts[key] = min(len(baseItems), len(targetItems))
-			keys = append(keys, key)
+	pairOf := make([]int, len(base)) // base index -> target index, -1 if unpaired
+	for i := range pairOf {
+		pairOf[i] = -1
+	}
+	usedTarget := make([]bool, len(target))
+
+	byJSON := make(map[string][]int, len(target))
+	for j, key := range targetKeys {
+		byJSON[key] = append(byJSON[key], j)
+	}
+	for i, key := range baseKeys {
+		if queue := byJSON[key]; len(queue) > 0 {
+			pairOf[i], usedTarget[queue[0]] = queue[0], true
+			byJSON[key] = queue[1:]
 		}
 	}
-	sort.Strings(keys)
 
-	baseOrder := orderedByGroups(baseGroups, commonCounts, keys)
-	targetOrder := orderedByGroups(targetGroups, commonCounts, keys)
+	byName := make(map[string][]int)
+	for j, item := range target {
+		if name, ok := elementName(item); ok && !usedTarget[j] {
+			byName[name] = append(byName[name], j)
+		}
+	}
+	for i, item := range base {
+		if pairOf[i] >= 0 {
+			continue
+		}
+		if name, ok := elementName(item); ok {
+			if queue := byName[name]; len(queue) > 0 {
+				pairOf[i], usedTarget[queue[0]] = queue[0], true
+				byName[name] = queue[1:]
+			}
+		}
+	}
+
+	baseOrder := make([]any, 0, len(base))
+	targetOrder := make([]any, 0, len(target))
+	for i, j := range pairOf {
+		if j >= 0 {
+			baseOrder = append(baseOrder, base[i])
+			targetOrder = append(targetOrder, target[j])
+		}
+	}
+	for i, j := range pairOf {
+		if j < 0 {
+			baseOrder = append(baseOrder, base[i])
+		}
+	}
+	for j, item := range target {
+		if !usedTarget[j] {
+			targetOrder = append(targetOrder, item)
+		}
+	}
 	copy(base, baseOrder)
 	copy(target, targetOrder)
 }
 
-func groupByCanonicalKey(list []any) map[string][]any {
-	groups := make(map[string][]any, len(list))
-	for _, item := range list {
+func jsonKeys(list []any) ([]string, bool) {
+	keys := make([]string, len(list))
+	for i, item := range list {
 		encoded, err := json.Marshal(item)
 		if err != nil {
-			return nil
+			return nil, false
 		}
-		key := string(encoded)
-		groups[key] = append(groups[key], item)
+		keys[i] = string(encoded)
 	}
-	return groups
+	return keys, true
 }
 
-func orderedByGroups(groups map[string][]any, commonCounts map[string]int, commonKeys []string) []any {
-	ordered := make([]any, 0)
-	for _, key := range commonKeys {
-		ordered = append(ordered, groups[key][:commonCounts[key]]...)
+func elementName(item any) (string, bool) {
+	if m, ok := item.(map[string]any); ok {
+		name, ok := m["name"].(string)
+		return name, ok
 	}
-
-	var unmatchedKeys []string
-	for key, items := range groups {
-		if len(items) > commonCounts[key] {
-			unmatchedKeys = append(unmatchedKeys, key)
-		}
-	}
-	sort.Strings(unmatchedKeys)
-	for _, key := range unmatchedKeys {
-		ordered = append(ordered, groups[key][commonCounts[key]:]...)
-	}
-	return ordered
+	return "", false
 }
 
 func apply(node any, segments []segment) {

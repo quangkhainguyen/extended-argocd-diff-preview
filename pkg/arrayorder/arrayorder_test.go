@@ -222,3 +222,90 @@ func TestAlign_RootKindFilter(t *testing.T) {
 		})
 	}
 }
+
+func TestAlign_PairsChangedNamedElementsAtSortedPosition(t *testing.T) {
+	rules := mustRules(t, ".list")
+	base := parseYAML(t, `
+list:
+- {name: c, value: "1"}
+- {name: a, value: "1"}
+- {name: b, value: "1"}
+`)
+	target := parseYAML(t, `
+list:
+- {name: b, value: "1"}
+- {name: c, value: "2"}
+- {name: a, value: "1"}
+`)
+	Apply(base, rules)
+	Apply(target, rules)
+	Align(base, target, rules)
+
+	assert.Equal(t, []any{"a", "b", "c"}, namesOf(base["list"]))
+	assert.Equal(t, []any{"a", "b", "c"}, namesOf(target["list"]))
+}
+
+func TestAlign_UnpairedElementsFollowPairedOnes(t *testing.T) {
+	rules := mustRules(t, ".list")
+	base := parseYAML(t, "list: [{name: old}, {name: keep}]")
+	target := parseYAML(t, "list: [{name: keep}, {name: new}]")
+	Align(base, target, rules)
+
+	assert.Equal(t, []any{"keep", "old"}, namesOf(base["list"]))
+	assert.Equal(t, []any{"keep", "new"}, namesOf(target["list"]))
+}
+
+func TestAlign_PreservesMultiplicityOfDuplicates(t *testing.T) {
+	rules := mustRules(t, ".list")
+	base := parseYAML(t, "list: [p, q, p]")
+	target := parseYAML(t, "list: [p, q]")
+	Align(base, target, rules)
+
+	assert.ElementsMatch(t, []any{"p", "q", "p"}, base["list"])
+	assert.ElementsMatch(t, []any{"p", "q"}, target["list"])
+	assert.Equal(t, []any{"p", "q"}, base["list"].([]any)[:2])
+	assert.Equal(t, []any{"p", "q"}, target["list"])
+}
+
+func TestAlign_RecursiveDescentAndWildcard(t *testing.T) {
+	base := parseYAML(t, deployment)
+	target := parseYAML(t, deployment)
+	target["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["env"] = []any{
+		map[string]any{"name": "VAR_A", "value": "1"},
+		map[string]any{"name": "VAR_B", "value": "changed"},
+	}
+	Align(base, target, mustRules(t, "..containers[*].env"))
+
+	baseEnv := base["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["env"]
+	assert.Equal(t, []any{"VAR_B", "VAR_A"}, namesOf(baseEnv))
+	targetEnv := target["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["env"]
+	assert.Equal(t, []any{"VAR_B", "VAR_A"}, namesOf(targetEnv))
+}
+
+func TestAlign_IgnoresMismatchedShapes(t *testing.T) {
+	rules := mustRules(t, ".list")
+	base := map[string]any{"list": []any{"b", "a"}}
+	target := map[string]any{"list": "not-a-list"}
+	Align(base, target, rules)
+	assert.Equal(t, []any{"b", "a"}, base["list"])
+
+	Align(map[string]any{}, map[string]any{"list": []any{"b"}}, rules)
+}
+
+func TestParse_RootFilterOnlyAllowedAsFirstSegment(t *testing.T) {
+	_, err := Parse(`.spec[?(@.kind == 'Deployment')].template`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported filter")
+}
+
+func namesOf(v any) []any {
+	var names []any
+	for _, e := range v.([]any) {
+		if m, ok := e.(map[string]any); ok {
+			names = append(names, m["name"])
+		} else {
+			names = append(names, e)
+		}
+	}
+	return names
+}
