@@ -67,7 +67,9 @@ func TestFromString(t *testing.T) {
 		{name: "no leading dot", input: "spec.volumes", want: []string{"spec.volumes"}},
 		{name: "quoted field", input: ".metadata.annotations['a.b/c']", want: []string{".metadata.annotations['a.b/c']"}},
 		{name: "unclosed bracket", input: ".spec.containers[*", wantErr: "unclosed"},
-		{name: "filter not supported", input: ".spec.containers[?(@.name=='a')]", wantErr: "unsupported bracket"},
+		{name: "nested filter not supported", input: ".spec.containers[?(@.name=='a')]", wantErr: "unsupported filter"},
+		{name: "unsupported filter operator", input: "$[?(@.kind != 'Deployment')].spec", wantErr: "unsupported filter"},
+		{name: "unsupported compound filter", input: "$[?(@.kind == 'Deployment' || @.kind == 'Pod')].spec", wantErr: "unsupported filter"},
 		{name: "empty field", input: ".spec..", wantErr: "recursive descent"},
 		{name: "missing field name", input: ".spec.[*]", wantErr: "missing field name"},
 	}
@@ -175,4 +177,48 @@ list:
 	Apply(a, rules)
 	Apply(b, rules)
 	assert.Equal(t, toYAML(t, a), toYAML(t, b))
+}
+
+func TestApply_RootKindFilter(t *testing.T) {
+	for _, expression := range []string{
+		`$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env`,
+		`$[?(@.kind=="Deployment")].spec.template.spec.containers[*].env`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			rules := mustRules(t, expression)
+			for _, kind := range []string{"Deployment", "StatefulSet", ""} {
+				t.Run(kind, func(t *testing.T) {
+					obj := parseYAML(t, deployment)
+					if kind == "" {
+						delete(obj, "kind")
+					} else {
+						obj["kind"] = kind
+					}
+					expected := parseYAML(t, toYAML(t, obj))
+					if kind == "Deployment" {
+						Apply(expected, mustRules(t, ".spec.template.spec.containers[*].env"))
+					}
+					Apply(obj, rules)
+					assert.Equal(t, expected, obj)
+				})
+			}
+		})
+	}
+}
+
+func TestAlign_RootKindFilter(t *testing.T) {
+	rules := mustRules(t, `$[?(@.kind == 'Deployment')].list`)
+	for _, kind := range []string{"Deployment", "StatefulSet"} {
+		t.Run(kind, func(t *testing.T) {
+			base := map[string]any{"kind": kind, "list": []any{"a", "b"}}
+			target := map[string]any{"kind": kind, "list": []any{"b", "c"}}
+			Align(base, target, rules)
+			if kind == "Deployment" {
+				assert.Equal(t, []any{"b", "a"}, base["list"])
+			} else {
+				assert.Equal(t, []any{"a", "b"}, base["list"])
+			}
+			assert.Equal(t, []any{"b", "c"}, target["list"])
+		})
+	}
 }

@@ -83,7 +83,7 @@ func TestSortArraysInApps_DoesNotMutateInput(t *testing.T) {
 }
 
 func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
-	rules, err := arrayorder.FromString(".spec.template.spec.containers[*].env")
+	rules, err := arrayorder.FromString(`$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env`)
 	require.NoError(t, err)
 
 	base := deploymentWithEnv(t, `
@@ -138,7 +138,7 @@ func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
 
 	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
 	roleConfig := map[string]any{
-		"name": "role-config-volume",
+		"name":      "role-config-volume",
 		"configMap": map[string]any{"name": "default-role-config-cm"},
 	}
 	tokens := map[string]any{
@@ -180,12 +180,12 @@ func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
 }
 
 func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testing.T) {
-	rules, err := arrayorder.FromString(".spec.template.spec.volumes")
+	rules, err := arrayorder.FromString(`$[?(@.kind == 'Deployment')].spec.template.spec.volumes`)
 	require.NoError(t, err)
 
 	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
 	roleConfig := map[string]any{
-		"name":     "role-config-volume",
+		"name":      "role-config-volume",
 		"configMap": map[string]any{"name": "default-role-config-cm"},
 	}
 	projectedToken := func(name string) map[string]any {

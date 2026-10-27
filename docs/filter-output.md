@@ -72,6 +72,9 @@ Reordering list entries (e.g. environment variables after refactoring a Helm tem
 # Environment variables of all containers in Deployments, StatefulSets, DaemonSets, Jobs, ...
 argocd-diff-preview --ignore-array-order='.spec.template.spec.containers[*].env'
 
+# Environment variables of Deployments only
+argocd-diff-preview --ignore-array-order="\$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env"
+
 # Environment variables of any container type, at any depth (also Pods, CronJobs, CRDs)
 argocd-diff-preview --ignore-array-order='..containers[*].env,..initContainers[*].env'
 
@@ -88,8 +91,9 @@ Supported JSONPath syntax (a subset of [kubectl JSONPath](https://kubernetes.io/
 | `[*]` / `.*`   | All array elements / all map values                      |
 | `[n]`          | Array element at index `n`                               |
 | `['a.b/c']`    | Field whose name contains special characters             |
+| `[?(@.kind == 'Deployment')]` | Root manifest string-field equality filter |
 
-A leading `$` and kubectl-style braces (`{.spec...}`) are accepted. Filter expressions (`[?(...)]`), slices and unions are not supported. Paths that don't match anything in a resource are ignored.
+A leading `$` and kubectl-style braces (`{.spec...}`) are accepted. A root filter tests the current manifest, not an array of manifests. It supports `==` on a direct string field (such as `kind` or `apiVersion`), with single- or double-quoted string values. Nested filters, other operators, compound conditions, slices and unions are not supported. Paths that don't match anything in a resource are ignored.
 
 Real changes (added, removed or modified elements) are still shown. The sorting only affects the diff - files written with `--output-app-manifests` or `--output-branch-manifests` keep the original order.
 

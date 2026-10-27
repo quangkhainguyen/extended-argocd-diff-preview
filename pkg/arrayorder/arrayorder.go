@@ -3,6 +3,7 @@ package arrayorder
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 //	.*  / [*]      all map values / all array elements
 //	[n]            array element n
 //	['a.b']        child field whose name contains special characters
+//	[?(@.kind == 'Deployment')] root string-field equality filter
 //
 // The path may optionally be prefixed with "$" or wrapped in "{...}".
 type Rule struct {
@@ -32,13 +34,17 @@ const (
 	segWildcard
 	segIndex
 	segRecursive
+	segRootFilter
 )
 
 type segment struct {
 	kind  segmentKind
 	name  string
 	index int
+	value string
 }
+
+var rootFilterPattern = regexp.MustCompile(`^\[\?\(\s*@\.([A-Za-z_][A-Za-z0-9_]*)\s*==\s*(?:'([^']*)'|"([^"]*)")\s*\)\]`)
 
 func (r Rule) String() string {
 	return r.raw
@@ -105,6 +111,15 @@ func Parse(raw string) (Rule, error) {
 			}
 			i = next
 		case p[i] == '[':
+			if strings.HasPrefix(p[i:], "[?") {
+				match := rootFilterPattern.FindStringSubmatch(p[i:])
+				if len(segments) != 0 || match == nil {
+					return fail("unsupported filter: use a root string equality filter such as $[?(@.kind == 'Deployment')]")
+				}
+				segments = append(segments, segment{kind: segRootFilter, name: match[1], value: match[2] + match[3]})
+				i += len(match[0])
+				continue
+			}
 			end := strings.IndexByte(p[i:], ']')
 			if end < 0 {
 				return fail("unclosed '['")
@@ -166,6 +181,10 @@ func align(base, target any, segments []segment) {
 
 	seg, rest := segments[0], segments[1:]
 	switch seg.kind {
+	case segRootFilter:
+		if matchesRootFilter(base, seg) && matchesRootFilter(target, seg) {
+			align(base, target, rest)
+		}
 	case segField:
 		baseMap, baseOK := base.(map[string]any)
 		targetMap, targetOK := target.(map[string]any)
@@ -302,6 +321,10 @@ func apply(node any, segments []segment) {
 
 	seg, rest := segments[0], segments[1:]
 	switch seg.kind {
+	case segRootFilter:
+		if matchesRootFilter(node, seg) {
+			apply(node, rest)
+		}
 	case segField:
 		if m, ok := node.(map[string]any); ok {
 			if child, ok := m[seg.name]; ok {
@@ -326,6 +349,15 @@ func apply(node any, segments []segment) {
 	case segRecursive:
 		applyRecursive(node, seg.name, rest)
 	}
+}
+
+func matchesRootFilter(node any, filter segment) bool {
+	obj, ok := node.(map[string]any)
+	if !ok {
+		return false
+	}
+	value, ok := obj[filter.name].(string)
+	return ok && value == filter.value
 }
 
 func applyRecursive(node any, name string, rest []segment) {
