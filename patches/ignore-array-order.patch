@@ -1,0 +1,1778 @@
+From bef65ad0719b88d754c006c5f332ebaa161f6b16 Mon Sep 17 00:00:00 2001
+From: Quang Khai Nguyen <quang_khai.nguyen2@sbb.ch>
+Date: Fri, 23 Oct 2026 12:09:56 +0200
+Subject: [PATCH] Introduce Ignore Array
+
+
+diff --git a/cmd/main.go b/cmd/main.go
+index 00c201e..8cce6fd 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -408,6 +408,7 @@ func run(cfg *Config) error {
+ 		selectionInfo,
+ 		cfg.ArgocdUIURL,
+ 		cfg.IgnoreResourceRules,
++		cfg.IgnoreArrayOrder,
+ 	)
+ 	if err != nil {
+ 		log.Error().Msg("❌ Failed to generate diff")
+diff --git a/cmd/options.go b/cmd/options.go
+index 890e7b9..ca4e357 100644
+--- a/cmd/options.go
++++ b/cmd/options.go
+@@ -19,6 +19,7 @@ import (
+ 	"k8s.io/klog/v2"
+ 
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/app_selector"
++	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/cluster"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/git"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/k3d"
+@@ -76,6 +77,7 @@ var (
+ 	DefaultWatchIfNoWatchPatternFound           = true
+ 	DefaultIgnoreInvalidWatchPattern            = false
+ 	DefaultHideDeletedAppDiff                   = false
++	DefaultIgnoreArrayOrder                     = ""
+ 	DefaultIgnoreResourceRules                  = ""
+ 	DefaultArgocdLoginOptions                   = ""
+ 	DefaultDisableClientThrottling              = true
+@@ -134,6 +136,7 @@ type RawOptions struct {
+ 	LogFormat                            string `mapstructure:"log-format"`
+ 	Title                                string `mapstructure:"title"`
+ 	HideDeletedAppDiff                   bool   `mapstructure:"hide-deleted-app-diff"`
++	IgnoreArrayOrder                     string `mapstructure:"ignore-array-order"`
+ 	IgnoreResourceRules                  string `mapstructure:"ignore-resources"`
+ 	DisableClientThrottling              bool   `mapstructure:"disable-client-throttling"`
+ 	ArgocdUIURL                          string `mapstructure:"argocd-ui-url"`
+@@ -199,6 +202,7 @@ type Config struct {
+ 	FilesChanged        []string
+ 	RedirectRevisions   []string
+ 	IgnoreResourceRules []resource_filter.IgnoreResourceRule
++	IgnoreArrayOrder    []arrayorder.Rule
+ 	ClusterProvider     cluster.Provider
+ }
+ 
+@@ -282,6 +286,7 @@ func Parse() *Config {
+ 	viper.SetDefault("title", DefaultTitle)
+ 	viper.SetDefault("dry-run", DefaultDryRun)
+ 	viper.SetDefault("hide-deleted-app-diff", DefaultHideDeletedAppDiff)
++	viper.SetDefault("ignore-array-order", DefaultIgnoreArrayOrder)
+ 	viper.SetDefault("ignore-resources", DefaultIgnoreResourceRules)
+ 	viper.SetDefault("disable-client-throttling", DefaultDisableClientThrottling)
+ 	viper.SetDefault("concurrency", DefaultConcurrency)
+@@ -348,6 +353,7 @@ func Parse() *Config {
+ 	rootCmd.Flags().String("redirect-target-revisions", "", "Comma-separated source targetRevision values to redirect to the target branch. Example: main,HEAD. By default, every targetRevision in matching repositories is redirected")
+ 	rootCmd.Flags().String("title", DefaultTitle, "Custom title for the markdown output")
+ 	rootCmd.Flags().Bool("hide-deleted-app-diff", DefaultHideDeletedAppDiff, "Hide diff content for fully deleted applications (only show deletion header)")
++	rootCmd.Flags().String("ignore-array-order", DefaultIgnoreArrayOrder, "Comma-separated JSONPaths of arrays whose element order is ignored in the diff. Example: '.spec.template.spec.containers[*].env'")
+ 	rootCmd.Flags().String("argocd-ui-url", DefaultArgocdUIURL, "Argo CD URL to generate application links in diff output (e.g., https://argocd.example.com)")
+ 	rootCmd.Flags().Bool("output-app-manifests", DefaultOutputAppManifests, "Write per-application manifest files to the output folder (output/base/ and output/target/)")
+ 	rootCmd.Flags().Bool("output-branch-manifests", DefaultOutputBranchManifests, "Write all application manifests per branch to a single file (output/base-branch.yaml and output/target-branch.yaml)")
+@@ -491,6 +497,11 @@ func (o *RawOptions) ToConfig() (*Config, error) {
+ 		return nil, fmt.Errorf("invalid ignore-resources: %w", err)
+ 	}
+ 
++	cfg.IgnoreArrayOrder, err = arrayorder.FromString(o.IgnoreArrayOrder)
++	if err != nil {
++		return nil, fmt.Errorf("invalid ignore-array-order: %w", err)
++	}
++
+ 	// Parse redirect revisions
+ 	cfg.RedirectRevisions = o.parseRedirectRevisions()
+ 
+@@ -837,6 +848,13 @@ func (o *Config) LogConfig() {
+ 	if o.HideDeletedAppDiff {
+ 		log.Info().Msgf("✨ - hide-deleted-app-diff: %t", o.HideDeletedAppDiff)
+ 	}
++	if len(o.IgnoreArrayOrder) > 0 {
++		paths := make([]string, len(o.IgnoreArrayOrder))
++		for i, rule := range o.IgnoreArrayOrder {
++			paths[i] = rule.String()
++		}
++		log.Info().Msgf("✨ - ignore-array-order: %s", strings.Join(paths, ", "))
++	}
+ 	if len(o.IgnoreResourceRules) > 0 {
+ 		ignoreResourceRuleStrings := make([]string, len(o.IgnoreResourceRules))
+ 		for i, ignoreResourceRule := range o.IgnoreResourceRules {
+diff --git a/docs/filter-output.md b/docs/filter-output.md
+index ef5bc15..010e8da 100644
+--- a/docs/filter-output.md
++++ b/docs/filter-output.md
+@@ -61,6 +61,43 @@ This hides all lines containing the word `caBundle`.
+ 
+ ---
+ 
++## Ignore array order
++
++Reordering list entries (e.g. environment variables after refactoring a Helm template) shows up as a diff, even though often nothing meaningful changed. Use `--ignore-array-order` with a list of JSONPath expressions (comma or newline separated). Every array matched by one of the paths is sorted into a canonical order before the diff is generated:
++
++- If every element has a `name` field (e.g. `env`, `ports`, `volumes`, `volumeMounts`), the array is sorted by `name`.
++- Otherwise, elements are sorted by their JSON representation.
++
++```bash
++# Environment variables of all containers in Deployments, StatefulSets, DaemonSets, Jobs, ...
++argocd-diff-preview --ignore-array-order='.spec.template.spec.containers[*].env'
++
++# Environment variables of any container type, at any depth (also Pods, CronJobs, CRDs)
++argocd-diff-preview --ignore-array-order='..containers[*].env,..initContainers[*].env'
++
++# Volumes and volume mounts
++argocd-diff-preview --ignore-array-order='.spec.template.spec.volumes,..containers[*].volumeMounts'
++```
++
++Supported JSONPath syntax (a subset of [kubectl JSONPath](https://kubernetes.io/docs/reference/kubectl/jsonpath/)):
++
++| Syntax         | Meaning                                                  |
++| -------------- | -------------------------------------------------------- |
++| `.field`       | Child field                                              |
++| `..field`      | Field at any depth (recursive descent)                   |
++| `[*]` / `.*`   | All array elements / all map values                      |
++| `[n]`          | Array element at index `n`                               |
++| `['a.b/c']`    | Field whose name contains special characters             |
++
++A leading `$` and kubectl-style braces (`{.spec...}`) are accepted. Filter expressions (`[?(...)]`), slices and unions are not supported. Paths that don't match anything in a resource are ignored.
++
++Real changes (added, removed or modified elements) are still shown. The sorting only affects the diff - files written with `--output-app-manifests` or `--output-branch-manifests` keep the original order.
++
++!!! warning
++    Array order is not always irrelevant. For example, Kubernetes only expands `$(VAR_NAME)` references to environment variables defined **earlier** in the list, and the order of `args`, `command` or `initContainers` matters. A reordering of a matched array will not show up in the diff.
++
++---
++
+ ## Ignore resources
+ 
+ Use `--ignore-resources` to exclude entire resources from the diff. The format is:
+diff --git a/docs/options.md b/docs/options.md
+index c923b71..debdd2d 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -57,6 +57,7 @@ argocd-diff-preview [FLAGS] [OPTIONS] (--repo <repo> | --repo-regex <regex>) --t
+ | `--diff-ignore <pattern>`, `-i`           | `DIFF_IGNORE`                | -                                      | Ignore lines in diff. Example: `v[1,9]+.[1,9]+.[1,9]+` for ignoring version changes         |
+ | `--file-regex <regex>`, `-r`              | `FILE_REGEX`                 | -                                      | Regex to filter files. Example: `/apps_.*\.yaml`                                            |
+ | `--files-changed <files>`                 | `FILES_CHANGED`              | -                                      | List of files changed between branches (comma, space or newline separated)                  |
++| `--ignore-array-order <paths>`            | `IGNORE_ARRAY_ORDER`         | -                                      | JSONPaths of arrays whose element order is ignored in the diff (comma or newline separated). Example: `.spec.template.spec.containers[*].env` |
+ | `--ignore-resources <rules>`              | `IGNORE_RESOURCES`           | -                                      | Ignore resources in diff. Format: `group:kind:name` (comma-separated, `*` wildcard)         |
+ | `--k3d-options <options>`                 | `K3D_OPTIONS`                | -                                      | k3d options (only for k3d)                                                                  |
+ | `--kind-options <options>`                | `KIND_OPTIONS`               | -                                      | kind options (only for kind)                                                                |
+diff --git a/pkg/arrayorder/arrayorder.go b/pkg/arrayorder/arrayorder.go
+new file mode 100644
+index 0000000..3fafbe9
+--- /dev/null
++++ b/pkg/arrayorder/arrayorder.go
+@@ -0,0 +1,241 @@
++package arrayorder
++
++import (
++	"encoding/json"
++	"fmt"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// Rule is a parsed JSONPath expression. Every array matched by the path is sorted
++// into a canonical order before diffing, so pure reorderings don't show up.
++//
++// Supported syntax (subset of Kubernetes/kubectl JSONPath):
++//
++//	.field         child field
++//	..field        recursive descent: "field" at any depth
++//	.*  / [*]      all map values / all array elements
++//	[n]            array element n
++//	['a.b']        child field whose name contains special characters
++//
++// The path may optionally be prefixed with "$" or wrapped in "{...}".
++type Rule struct {
++	raw      string
++	segments []segment
++}
++
++type segmentKind int
++
++const (
++	segField segmentKind = iota
++	segWildcard
++	segIndex
++	segRecursive
++)
++
++type segment struct {
++	kind  segmentKind
++	name  string
++	index int
++}
++
++func (r Rule) String() string {
++	return r.raw
++}
++
++// FromString parses a comma or newline separated list of JSONPath expressions.
++func FromString(s string) ([]Rule, error) {
++	var rules []Rule
++	for _, raw := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
++		raw = strings.TrimSpace(raw)
++		if raw == "" {
++			continue
++		}
++		rule, err := Parse(raw)
++		if err != nil {
++			return nil, err
++		}
++		rules = append(rules, rule)
++	}
++	return rules, nil
++}
++
++// Parse parses a single JSONPath expression.
++func Parse(raw string) (Rule, error) {
++	p := strings.TrimSpace(raw)
++	if strings.HasPrefix(p, "{") && strings.HasSuffix(p, "}") {
++		p = strings.TrimSpace(p[1 : len(p)-1])
++	}
++	p = strings.TrimPrefix(p, "$")
++
++	fail := func(msg string) (Rule, error) {
++		return Rule{}, fmt.Errorf("invalid JSONPath %q: %s", raw, msg)
++	}
++
++	if p == "" {
++		return fail("path is empty")
++	}
++	// Allow paths without leading dot, e.g. "spec.containers"
++	if p[0] != '.' && p[0] != '[' {
++		p = "." + p
++	}
++
++	var segments []segment
++	for i := 0; i < len(p); {
++		switch {
++		case strings.HasPrefix(p[i:], ".."):
++			i += 2
++			name, next := readName(p, i)
++			if name == "" || name == "*" {
++				return fail("recursive descent '..' must be followed by a field name")
++			}
++			segments = append(segments, segment{kind: segRecursive, name: name})
++			i = next
++		case p[i] == '.':
++			i++
++			name, next := readName(p, i)
++			if name == "" {
++				return fail(fmt.Sprintf("missing field name at position %d", i))
++			}
++			if name == "*" {
++				segments = append(segments, segment{kind: segWildcard})
++			} else {
++				segments = append(segments, segment{kind: segField, name: name})
++			}
++			i = next
++		case p[i] == '[':
++			end := strings.IndexByte(p[i:], ']')
++			if end < 0 {
++				return fail("unclosed '['")
++			}
++			content := strings.TrimSpace(p[i+1 : i+end])
++			i += end + 1
++			switch {
++			case content == "*":
++				segments = append(segments, segment{kind: segWildcard})
++			case len(content) >= 2 && (content[0] == '\'' || content[0] == '"') && content[len(content)-1] == content[0]:
++				segments = append(segments, segment{kind: segField, name: content[1 : len(content)-1]})
++			default:
++				n, err := strconv.Atoi(content)
++				if err != nil || n < 0 {
++					return fail(fmt.Sprintf("unsupported bracket expression [%s] (use [*], [n] or ['field'])", content))
++				}
++				segments = append(segments, segment{kind: segIndex, index: n})
++			}
++		default:
++			return fail(fmt.Sprintf("unexpected character %q at position %d", p[i], i))
++		}
++	}
++
++	return Rule{raw: strings.TrimSpace(raw), segments: segments}, nil
++}
++
++func readName(p string, start int) (string, int) {
++	end := start
++	for end < len(p) && p[end] != '.' && p[end] != '[' {
++		end++
++	}
++	return strings.TrimSpace(p[start:end]), end
++}
++
++// Apply sorts, in place, every array in obj matched by any of the rules.
++func Apply(obj map[string]any, rules []Rule) {
++	for _, rule := range rules {
++		apply(obj, rule.segments)
++	}
++}
++
++func apply(node any, segments []segment) {
++	if len(segments) == 0 {
++		if list, ok := node.([]any); ok {
++			sortCanonical(list)
++		}
++		return
++	}
++
++	seg, rest := segments[0], segments[1:]
++	switch seg.kind {
++	case segField:
++		if m, ok := node.(map[string]any); ok {
++			if child, ok := m[seg.name]; ok {
++				apply(child, rest)
++			}
++		}
++	case segIndex:
++		if list, ok := node.([]any); ok && seg.index < len(list) {
++			apply(list[seg.index], rest)
++		}
++	case segWildcard:
++		switch v := node.(type) {
++		case map[string]any:
++			for _, child := range v {
++				apply(child, rest)
++			}
++		case []any:
++			for _, child := range v {
++				apply(child, rest)
++			}
++		}
++	case segRecursive:
++		applyRecursive(node, seg.name, rest)
++	}
++}
++
++func applyRecursive(node any, name string, rest []segment) {
++	switch v := node.(type) {
++	case map[string]any:
++		if child, ok := v[name]; ok {
++			apply(child, rest)
++		}
++		for _, child := range v {
++			applyRecursive(child, name, rest)
++		}
++	case []any:
++		for _, child := range v {
++			applyRecursive(child, name, rest)
++		}
++	}
++}
++
++// sortCanonical sorts by the "name" field when every element has one (e.g. env vars,
++// ports, volumes), otherwise by the element's JSON representation.
++func sortCanonical(list []any) {
++	if len(list) < 2 {
++		return
++	}
++	keys := make([]string, len(list))
++	allNamed := true
++	for i, e := range list {
++		if m, ok := e.(map[string]any); ok {
++			if name, ok := m["name"].(string); ok {
++				keys[i] = name
++				continue
++			}
++		}
++		allNamed = false
++		break
++	}
++	if !allNamed {
++		for i, e := range list {
++			b, err := json.Marshal(e)
++			if err != nil {
++				return
++			}
++			keys[i] = string(b)
++		}
++	}
++	sort.Stable(byKey{list: list, keys: keys})
++}
++
++type byKey struct {
++	list []any
++	keys []string
++}
++
++func (b byKey) Len() int           { return len(b.list) }
++func (b byKey) Less(i, j int) bool { return b.keys[i] < b.keys[j] }
++func (b byKey) Swap(i, j int) {
++	b.list[i], b.list[j] = b.list[j], b.list[i]
++	b.keys[i], b.keys[j] = b.keys[j], b.keys[i]
++}
+diff --git a/pkg/arrayorder/arrayorder_test.go b/pkg/arrayorder/arrayorder_test.go
+new file mode 100644
+index 0000000..12b4c14
+--- /dev/null
++++ b/pkg/arrayorder/arrayorder_test.go
+@@ -0,0 +1,178 @@
++package arrayorder
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"sigs.k8s.io/yaml"
++)
++
++func parseYAML(t *testing.T, y string) map[string]any {
++	t.Helper()
++	obj := map[string]any{}
++	require.NoError(t, yaml.Unmarshal([]byte(y), &obj))
++	return obj
++}
++
++func toYAML(t *testing.T, obj map[string]any) string {
++	t.Helper()
++	b, err := yaml.Marshal(obj)
++	require.NoError(t, err)
++	return string(b)
++}
++
++func mustRules(t *testing.T, s string) []Rule {
++	t.Helper()
++	rules, err := FromString(s)
++	require.NoError(t, err)
++	return rules
++}
++
++const deployment = `
++apiVersion: apps/v1
++kind: Deployment
++spec:
++  template:
++    spec:
++      initContainers:
++      - name: init
++        env:
++        - name: VAR_B
++        - name: VAR_A
++      containers:
++      - name: app
++        args: ["--z", "--a"]
++        env:
++        - name: VAR_B
++          value: "2"
++        - name: VAR_A
++          value: "1"
++        ports:
++        - containerPort: 9090
++        - containerPort: 8080
++`
++
++func TestFromString(t *testing.T) {
++	tests := []struct {
++		name    string
++		input   string
++		want    []string
++		wantErr string
++	}{
++		{name: "empty", input: "  ", want: nil},
++		{name: "single", input: ".spec.containers[*].env", want: []string{".spec.containers[*].env"}},
++		{name: "comma and newline separated", input: ".a.b,\n ..env \n,$.c[0].d", want: []string{".a.b", "..env", "$.c[0].d"}},
++		{name: "kubectl braces", input: "{.spec.containers[*].env}", want: []string{"{.spec.containers[*].env}"}},
++		{name: "no leading dot", input: "spec.volumes", want: []string{"spec.volumes"}},
++		{name: "quoted field", input: ".metadata.annotations['a.b/c']", want: []string{".metadata.annotations['a.b/c']"}},
++		{name: "unclosed bracket", input: ".spec.containers[*", wantErr: "unclosed"},
++		{name: "filter not supported", input: ".spec.containers[?(@.name=='a')]", wantErr: "unsupported bracket"},
++		{name: "empty field", input: ".spec..", wantErr: "recursive descent"},
++		{name: "missing field name", input: ".spec.[*]", wantErr: "missing field name"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			rules, err := FromString(tc.input)
++			if tc.wantErr != "" {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tc.wantErr)
++				return
++			}
++			require.NoError(t, err)
++			var got []string
++			for _, r := range rules {
++				got = append(got, r.String())
++			}
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestApply_ExactPathOnlySortsMatchedArray(t *testing.T) {
++	obj := parseYAML(t, deployment)
++	Apply(obj, mustRules(t, ".spec.template.spec.containers[*].env"))
++
++	assert.Equal(t, parseYAML(t, `
++apiVersion: apps/v1
++kind: Deployment
++spec:
++  template:
++    spec:
++      initContainers:
++      - name: init
++        env:
++        - name: VAR_B
++        - name: VAR_A
++      containers:
++      - name: app
++        args: ["--z", "--a"]
++        env:
++        - name: VAR_A
++          value: "1"
++        - name: VAR_B
++          value: "2"
++        ports:
++        - containerPort: 9090
++        - containerPort: 8080
++`), obj)
++}
++
++func TestApply_RecursiveDescentAndUnnamedElements(t *testing.T) {
++	obj := parseYAML(t, deployment)
++	Apply(obj, mustRules(t, "..env, ..containers[0].ports"))
++
++	assert.Equal(t, parseYAML(t, `
++apiVersion: apps/v1
++kind: Deployment
++spec:
++  template:
++    spec:
++      initContainers:
++      - name: init
++        env:
++        - name: VAR_A
++        - name: VAR_B
++      containers:
++      - name: app
++        args: ["--z", "--a"]
++        env:
++        - name: VAR_A
++          value: "1"
++        - name: VAR_B
++          value: "2"
++        ports:
++        - containerPort: 8080
++        - containerPort: 9090
++`), obj)
++}
++
++func TestApply_ScalarArrayWildcardAndMissingPath(t *testing.T) {
++	obj := parseYAML(t, `
++spec:
++  groups:
++    a: [c, b, a]
++    b: [3, 1, 2]
++`)
++	Apply(obj, mustRules(t, ".spec.groups.*, .does.not.exist[*], .spec.groups.a[5]"))
++	assert.Equal(t, "spec:\n  groups:\n    a:\n    - a\n    - b\n    - c\n    b:\n    - 1\n    - 2\n    - 3\n", toYAML(t, obj))
++}
++
++func TestApply_IsDeterministicForPermutations(t *testing.T) {
++	a := parseYAML(t, `
++list:
++- {name: x, value: "1"}
++- {name: y, valueFrom: {secretKeyRef: {name: s, key: k}}}
++- {name: z, value: "3"}
++`)
++	b := parseYAML(t, `
++list:
++- {name: z, value: "3"}
++- {name: x, value: "1"}
++- {name: y, valueFrom: {secretKeyRef: {name: s, key: k}}}
++`)
++	rules := mustRules(t, ".list")
++	Apply(a, rules)
++	Apply(b, rules)
++	assert.Equal(t, toYAML(t, a), toYAML(t, b))
++}
+diff --git a/pkg/diff/generator.go b/pkg/diff/generator.go
+index f8a4b84..52fd548 100644
+--- a/pkg/diff/generator.go
++++ b/pkg/diff/generator.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/extract"
+ 	gitt "github.com/dag-andersen/argocd-diff-preview/pkg/git"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/matching"
+@@ -30,6 +31,7 @@ func GeneratePreview(
+ 	selectionInfo SelectionInfo,
+ 	argocdUIURL string,
+ 	ignoreResourceRules []resource_filter.IgnoreResourceRule,
++	ignoreArrayOrder []arrayorder.Rule,
+ ) (time.Duration, error) {
+ 	startTime := time.Now()
+ 	maxDiffMessageCharCount := maxCharCount
+@@ -45,6 +47,11 @@ func GeneratePreview(
+ 		lineCount = 3
+ 	}
+ 
++	if len(ignoreArrayOrder) > 0 {
++		baseManifests = sortArraysInApps(baseManifests, ignoreArrayOrder)
++		targetManifests = sortArraysInApps(targetManifests, ignoreArrayOrder)
++	}
++
+ 	// Generate diffs using the matching package
+ 	appDiffs, err := matching.GenerateAppDiffs(baseManifests, targetManifests, lineCount, diffIgnoreRegex, ignoreResourceRules)
+ 	if err != nil {
+diff --git a/pkg/diff/normalize.go b/pkg/diff/normalize.go
+new file mode 100644
+index 0000000..13b747d
+--- /dev/null
++++ b/pkg/diff/normalize.go
+@@ -0,0 +1,25 @@
++package diff
++
++import (
++	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
++	"github.com/dag-andersen/argocd-diff-preview/pkg/extract"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// sortArraysInApps returns deep copies of the apps where every array matched by
++// one of the rules is sorted into a canonical order.
++// The input is left untouched so manifest output files keep the original order.
++func sortArraysInApps(apps []extract.ExtractedApp, rules []arrayorder.Rule) []extract.ExtractedApp {
++	result := make([]extract.ExtractedApp, len(apps))
++	for i, app := range apps {
++		manifests := make([]unstructured.Unstructured, len(app.Manifests))
++		for j := range app.Manifests {
++			copied := app.Manifests[j].DeepCopy()
++			arrayorder.Apply(copied.Object, rules)
++			manifests[j] = *copied
++		}
++		app.Manifests = manifests
++		result[i] = app
++	}
++	return result
++}
+diff --git a/pkg/diff/normalize_test.go b/pkg/diff/normalize_test.go
+new file mode 100644
+index 0000000..60de2d2
+--- /dev/null
++++ b/pkg/diff/normalize_test.go
+@@ -0,0 +1,112 @@
++package diff
++
++import (
++	"testing"
++
++	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
++	"github.com/dag-andersen/argocd-diff-preview/pkg/extract"
++	"github.com/dag-andersen/argocd-diff-preview/pkg/git"
++	"github.com/dag-andersen/argocd-diff-preview/pkg/matching"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"sigs.k8s.io/yaml"
++)
++
++func deploymentWithEnv(t *testing.T, env string) unstructured.Unstructured {
++	t.Helper()
++	obj := map[string]any{}
++	require.NoError(t, yaml.Unmarshal([]byte(`
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: my-app
++  namespace: default
++spec:
++  template:
++    spec:
++      containers:
++      - name: app
++        image: nginx
++        env:
++`+env), &obj))
++	return unstructured.Unstructured{Object: obj}
++}
++
++func envNames(t *testing.T, m unstructured.Unstructured) []string {
++	t.Helper()
++	containers, _, err := unstructured.NestedSlice(m.Object, "spec", "template", "spec", "containers")
++	require.NoError(t, err)
++	var names []string
++	for _, e := range containers[0].(map[string]any)["env"].([]any) {
++		names = append(names, e.(map[string]any)["name"].(string))
++	}
++	return names
++}
++
++func newApps(m unstructured.Unstructured, branch git.BranchType) []extract.ExtractedApp {
++	return []extract.ExtractedApp{{Id: "app", Name: "app", SourcePath: "apps/app.yaml", Branch: branch, Manifests: []unstructured.Unstructured{m}}}
++}
++
++func TestSortArraysInApps_DoesNotMutateInput(t *testing.T) {
++	rules, err := arrayorder.FromString(".spec.template.spec.containers[*].env")
++	require.NoError(t, err)
++
++	apps := newApps(deploymentWithEnv(t, `
++        - name: VAR_B
++        - name: VAR_A
++`), git.Base)
++
++	sorted := sortArraysInApps(apps, rules)
++
++	assert.Equal(t, []string{"VAR_A", "VAR_B"}, envNames(t, sorted[0].Manifests[0]))
++	assert.Equal(t, []string{"VAR_B", "VAR_A"}, envNames(t, apps[0].Manifests[0]))
++}
++
++func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
++	rules, err := arrayorder.FromString(".spec.template.spec.containers[*].env")
++	require.NoError(t, err)
++
++	base := deploymentWithEnv(t, `
++        - name: B
++          value: "2"
++        - name: A
++          value: "1"
++`)
++	reordered := deploymentWithEnv(t, `
++        - name: A
++          value: "1"
++        - name: B
++          value: "2"
++`)
++	changed := deploymentWithEnv(t, `
++        - name: A
++          value: "1"
++        - name: B
++          value: "3"
++`)
++
++	// Without rules, a pure reorder produces a diff
++	diffs, err := matching.GenerateAppDiffs(newApps(base, git.Base), newApps(reordered, git.Target), 3, nil, nil)
++	require.NoError(t, err)
++	assert.Len(t, diffs, 1)
++
++	// With rules, a pure reorder produces no diff
++	diffs, err = matching.GenerateAppDiffs(
++		sortArraysInApps(newApps(base, git.Base), rules),
++		sortArraysInApps(newApps(reordered, git.Target), rules),
++		3, nil, nil)
++	require.NoError(t, err)
++	assert.Empty(t, diffs)
++
++	// Real value changes are still reported
++	diffs, err = matching.GenerateAppDiffs(
++		sortArraysInApps(newApps(base, git.Base), rules),
++		sortArraysInApps(newApps(changed, git.Target), rules),
++		3, nil, nil)
++	require.NoError(t, err)
++	require.Len(t, diffs, 1)
++	require.Len(t, diffs[0].Resources, 1)
++	assert.Contains(t, diffs[0].Resources[0].Content, `-          value: "2"`)
++	assert.Contains(t, diffs[0].Resources[0].Content, `+          value: "3"`)
++}
+
+From b6e3bc00dada4d69a28a55d6dbff473e6603afbd Mon Sep 17 00:00:00 2001
+From: Quang Khai Nguyen <quang_khai.nguyen2@sbb.ch>
+Date: Fri, 23 Oct 2026 12:33:44 +0200
+Subject: [PATCH] Update Integration Test for ignore array
+
+
+diff --git a/cmd/options_test.go b/cmd/options_test.go
+index afddde6..5f14be1 100644
+--- a/cmd/options_test.go
++++ b/cmd/options_test.go
+@@ -61,3 +61,41 @@ func TestRawOptionsToConfig_IncludeHelmHooksRenderMethod(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRawOptionsToConfig_IgnoreArrayOrder(t *testing.T) {
++	baseOptions := func(ignoreArrayOrder string) RawOptions {
++		return RawOptions{
++			BaseBranch:       "main",
++			TargetBranch:     "feature",
++			Repo:             "example/repo",
++			RenderMethod:     "cli",
++			DryRun:           true,
++			IgnoreArrayOrder: ignoreArrayOrder,
++		}
++	}
++
++	t.Run("empty", func(t *testing.T) {
++		options := baseOptions("")
++		cfg, err := options.ToConfig()
++		require.NoError(t, err)
++		assert.Empty(t, cfg.IgnoreArrayOrder)
++	})
++
++	t.Run("parses list of paths", func(t *testing.T) {
++		options := baseOptions(".spec.template.spec.containers[*].env, ..volumeMounts\n{.spec.template.spec.volumes}")
++		cfg, err := options.ToConfig()
++		require.NoError(t, err)
++		var paths []string
++		for _, rule := range cfg.IgnoreArrayOrder {
++			paths = append(paths, rule.String())
++		}
++		assert.Equal(t, []string{".spec.template.spec.containers[*].env", "..volumeMounts", "{.spec.template.spec.volumes}"}, paths)
++	})
++
++	t.Run("rejects invalid path", func(t *testing.T) {
++		options := baseOptions(".spec.containers[?(@.name=='app')].env")
++		_, err := options.ToConfig()
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "invalid ignore-array-order")
++	})
++}
+diff --git a/integration-test/README.md b/integration-test/README.md
+index 1cbc921..350ef77 100644
+--- a/integration-test/README.md
++++ b/integration-test/README.md
+@@ -190,6 +190,11 @@ Each `branch-N/target[-suffix]/` directory contains expected output files (`outp
+ - `branch-19/target`: Kustomize resource outside the application directory via `repo-server-api`. It requires global `kustomize.buildOptions: --load-restrictor LoadRestrictionsNone` from `argocd-cm`, proving the direct repo-server request forwards that setting.
+ - `branch-21/target`: Local Helm chart that gates a ServiceMonitor on the kind-level capability `monitoring.coreos.com/v1/ServiceMonitor`, via `repo-server-api` against a cluster with the ServiceMonitor CRD. The target enables it, so the diff must show the ServiceMonitor added, as a real Argo CD sync would render it.
+ 
++### Branch 22: Ignore Array Order
++Test data lives in the `quangkhainguyen/extended-argocd-diff-preview` fork (set via the `GitHubRepo` field). The target reorders `env`, `volumes` and `args` of a Deployment and changes one env var value.
++- `target-1`: Without options - all reorderings show up in the diff
++- `target-2`: `--ignore-array-order` on `env` and `volumes` - only the env value change and the `args` reorder remain
++
+ ## Prerequisites
+ 
+ - Docker running
+@@ -231,6 +236,7 @@ type TestCase struct {
+     MaxDiffLength              string // --max-diff-length
+     HideDeletedAppDiff         string // --hide-deleted-app-diff
+     IgnoreResources            string // --ignore-resources
++    IgnoreArrayOrder           string // --ignore-array-order
+     WatchIfNoWatchPatternFound string // --watch-if-no-watch-pattern-found
+     AutoDetectFilesChanged     string // --auto-detect-files-changed (uses git diff)
+     IgnoreInvalidWatchPattern  string // --ignore-invalid-watch-pattern
+@@ -239,6 +245,7 @@ type TestCase struct {
+     // Cluster/Auth options
+     KindOptions                string // --kind-options
+     CreateCluster              string // "true" to force a new cluster for this test
++    GitHubRepo                 string // "owner/repo" to clone test branches from; defaults to dag-andersen/argocd-diff-preview
+     ArgocdLoginOptions         string // --argocd-login-options
+     ArgocdAuthToken            string // --argocd-auth-token (used instead of username/password login)
+     RenderMethod               string // "cli", "server-api", "repo-server-api", or "" to use global -render-method flag
+diff --git a/integration-test/auth_token_test.go b/integration-test/auth_token_test.go
+index 522263f..5540f65 100644
+--- a/integration-test/auth_token_test.go
++++ b/integration-test/auth_token_test.go
+@@ -106,10 +106,10 @@ func TestAuthToken(t *testing.T) {
+ 	_ = os.RemoveAll(targetBranchDir)
+ 	_ = os.RemoveAll(outputDir)
+ 
+-	if err := cloneBranch("integration-test/branch-1/base", baseBranchDir); err != nil {
++	if err := cloneBranch(gitHubRepo(TestCase{}), "integration-test/branch-1/base", baseBranchDir); err != nil {
+ 		t.Fatalf("Failed to clone base branch: %v", err)
+ 	}
+-	if err := cloneBranch("integration-test/branch-1/target", targetBranchDir); err != nil {
++	if err := cloneBranch(gitHubRepo(TestCase{}), "integration-test/branch-1/target", targetBranchDir); err != nil {
+ 		t.Fatalf("Failed to clone target branch: %v", err)
+ 	}
+ 
+diff --git a/integration-test/branch-22/target-1/output.html b/integration-test/branch-22/target-1/output.html
+new file mode 100644
+index 0000000..bafc639
+--- /dev/null
++++ b/integration-test/branch-22/target-1/output.html
+@@ -0,0 +1,121 @@
++<html>
++<head>
++<meta charset="utf-8">
++<style>
++body {
++	font-family: arial;
++}
++.container {
++	margin: auto;
++	width: 910px;
++}
++.diffs {
++	margin: 20px 0 20px 0;
++}
++.diff_container {
++	width: 910px;
++	overflow-x: scroll;
++	border-radius: 8px;
++	background:rgb(239, 239, 239);
++	scrollbar-width: none;
++	margin: 10px 0 10px 0;
++}
++table {
++	font-family: monospace;
++	border-spacing: 0px;
++	width: 100%;
++}
++tr.normal_line {
++	background:rgb(239, 239, 239);
++}
++tr.added_line {
++	background:rgb(169, 216, 184);
++}
++tr.removed_line {
++	background:rgb(247, 149, 173);
++}
++tr.comment_line {
++	background:rgb(197, 194, 194);
++}
++.resource_header {
++	font-family: monospace;
++	font-size: 14px;
++	color: rgb(80, 80, 80);
++	margin: 15px 0 5px 0;
++	padding: 0;
++}
++.resource_header:first-of-type {
++	margin-top: 10px;
++}
++pre {
++	margin: 0;
++	padding-left: 15px;
++	padding-right: 15px;
++}
++</style>
++</head>
++<body>
++<div class="container">
++<h1>Argo CD Diff Preview</h1>
++
++<p>Summary:</p>
++<pre>Modified (1):
++± ignore-array-order (+5|-5)</pre>
++
++<div class="diffs">
++<details>
++<summary>
++ignore-array-order (examples/ignore-array-order/application.yaml)
++</summary>
++
++<h4 class="resource_header">Deployment: default/ignore-array-order</h4>
++<div class="diff_container">
++<table>
++
++	<tr class="normal_line"><td><pre>   selector:</pre></td></tr>
++	<tr class="normal_line"><td><pre>     matchLabels:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       app: ignore-array-order</pre></td></tr>
++	<tr class="normal_line"><td><pre>   template:</pre></td></tr>
++	<tr class="normal_line"><td><pre>     metadata:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       labels:</pre></td></tr>
++	<tr class="normal_line"><td><pre>         app: ignore-array-order</pre></td></tr>
++	<tr class="normal_line"><td><pre>     spec:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       containers:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       - args:</pre></td></tr>
++	<tr class="removed_line"><td><pre>-        - --first</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - --second</pre></td></tr>
++	<tr class="added_line"><td><pre>+        - --first</pre></td></tr>
++	<tr class="normal_line"><td><pre>         env:</pre></td></tr>
++	<tr class="added_line"><td><pre>+        - name: DB_PORT</pre></td></tr>
++	<tr class="added_line"><td><pre>+          value: &#34;5433&#34;</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - name: LOG_LEVEL</pre></td></tr>
++	<tr class="normal_line"><td><pre>           value: info</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - name: DB_HOST</pre></td></tr>
++	<tr class="normal_line"><td><pre>           value: postgres</pre></td></tr>
++	<tr class="removed_line"><td><pre>-        - name: DB_PORT</pre></td></tr>
++	<tr class="removed_line"><td><pre>-          value: &#34;5432&#34;</pre></td></tr>
++	<tr class="normal_line"><td><pre>         image: nginx:1.27</pre></td></tr>
++	<tr class="normal_line"><td><pre>         name: app</pre></td></tr>
++	<tr class="normal_line"><td><pre>         volumeMounts:</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - mountPath: /etc/config</pre></td></tr>
++	<tr class="normal_line"><td><pre>           name: config</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - mountPath: /var/cache</pre></td></tr>
++	<tr class="normal_line"><td><pre>           name: cache</pre></td></tr>
++	<tr class="normal_line"><td><pre>       volumes:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       - emptyDir: {}</pre></td></tr>
++	<tr class="removed_line"><td><pre>-        name: config</pre></td></tr>
++	<tr class="removed_line"><td><pre>-      - emptyDir: {}</pre></td></tr>
++	<tr class="normal_line"><td><pre>         name: cache</pre></td></tr>
++	<tr class="added_line"><td><pre>+      - emptyDir: {}</pre></td></tr>
++	<tr class="added_line"><td><pre>+        name: config</pre></td></tr>
++</table>
++</div>
++
++</details>
++</div>
++
++<pre>_Stats_:
++[Applications: 2], [Full Run: Xs], [Rendering: Xs], [Cluster: Xs], [Argo CD: Xs]</pre>
++</div>
++</body>
++</html>
+diff --git a/integration-test/branch-22/target-1/output.md b/integration-test/branch-22/target-1/output.md
+new file mode 100644
+index 0000000..e4b4d11
+--- /dev/null
++++ b/integration-test/branch-22/target-1/output.md
+@@ -0,0 +1,55 @@
++## Argo CD Diff Preview
++
++Summary:
++```yaml
++Modified (1):
++± ignore-array-order (+5|-5)
++```
++
++<details>
++<summary>ignore-array-order (examples/ignore-array-order/application.yaml)</summary>
++<br>
++
++#### Deployment: default/ignore-array-order
++```diff
++   selector:
++     matchLabels:
++       app: ignore-array-order
++   template:
++     metadata:
++       labels:
++         app: ignore-array-order
++     spec:
++       containers:
++       - args:
++-        - --first
++         - --second
+++        - --first
++         env:
+++        - name: DB_PORT
+++          value: "5433"
++         - name: LOG_LEVEL
++           value: info
++         - name: DB_HOST
++           value: postgres
++-        - name: DB_PORT
++-          value: "5432"
++         image: nginx:1.27
++         name: app
++         volumeMounts:
++         - mountPath: /etc/config
++           name: config
++         - mountPath: /var/cache
++           name: cache
++       volumes:
++       - emptyDir: {}
++-        name: config
++-      - emptyDir: {}
++         name: cache
+++      - emptyDir: {}
+++        name: config
++```
++</details>
++
++_Stats_:
++[Applications: 2], [Full Run: Xs], [Rendering: Xs], [Cluster: Xs], [Argo CD: Xs]
+diff --git a/integration-test/branch-22/target-2/output.html b/integration-test/branch-22/target-2/output.html
+new file mode 100644
+index 0000000..74cadae
+--- /dev/null
++++ b/integration-test/branch-22/target-2/output.html
+@@ -0,0 +1,114 @@
++<html>
++<head>
++<meta charset="utf-8">
++<style>
++body {
++	font-family: arial;
++}
++.container {
++	margin: auto;
++	width: 910px;
++}
++.diffs {
++	margin: 20px 0 20px 0;
++}
++.diff_container {
++	width: 910px;
++	overflow-x: scroll;
++	border-radius: 8px;
++	background:rgb(239, 239, 239);
++	scrollbar-width: none;
++	margin: 10px 0 10px 0;
++}
++table {
++	font-family: monospace;
++	border-spacing: 0px;
++	width: 100%;
++}
++tr.normal_line {
++	background:rgb(239, 239, 239);
++}
++tr.added_line {
++	background:rgb(169, 216, 184);
++}
++tr.removed_line {
++	background:rgb(247, 149, 173);
++}
++tr.comment_line {
++	background:rgb(197, 194, 194);
++}
++.resource_header {
++	font-family: monospace;
++	font-size: 14px;
++	color: rgb(80, 80, 80);
++	margin: 15px 0 5px 0;
++	padding: 0;
++}
++.resource_header:first-of-type {
++	margin-top: 10px;
++}
++pre {
++	margin: 0;
++	padding-left: 15px;
++	padding-right: 15px;
++}
++</style>
++</head>
++<body>
++<div class="container">
++<h1>Argo CD Diff Preview</h1>
++
++<p>Summary:</p>
++<pre>Modified (1):
++± ignore-array-order (+2|-2)</pre>
++
++<div class="diffs">
++<details>
++<summary>
++ignore-array-order (examples/ignore-array-order/application.yaml)
++</summary>
++
++<h4 class="resource_header">Deployment: default/ignore-array-order</h4>
++<div class="diff_container">
++<table>
++
++	<tr class="normal_line"><td><pre>   selector:</pre></td></tr>
++	<tr class="normal_line"><td><pre>     matchLabels:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       app: ignore-array-order</pre></td></tr>
++	<tr class="normal_line"><td><pre>   template:</pre></td></tr>
++	<tr class="normal_line"><td><pre>     metadata:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       labels:</pre></td></tr>
++	<tr class="normal_line"><td><pre>         app: ignore-array-order</pre></td></tr>
++	<tr class="normal_line"><td><pre>     spec:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       containers:</pre></td></tr>
++	<tr class="normal_line"><td><pre>       - args:</pre></td></tr>
++	<tr class="removed_line"><td><pre>-        - --first</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - --second</pre></td></tr>
++	<tr class="added_line"><td><pre>+        - --first</pre></td></tr>
++	<tr class="normal_line"><td><pre>         env:</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - name: DB_HOST</pre></td></tr>
++	<tr class="normal_line"><td><pre>           value: postgres</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - name: DB_PORT</pre></td></tr>
++	<tr class="removed_line"><td><pre>-          value: &#34;5432&#34;</pre></td></tr>
++	<tr class="added_line"><td><pre>+          value: &#34;5433&#34;</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - name: LOG_LEVEL</pre></td></tr>
++	<tr class="normal_line"><td><pre>           value: info</pre></td></tr>
++	<tr class="normal_line"><td><pre>         image: nginx:1.27</pre></td></tr>
++	<tr class="normal_line"><td><pre>         name: app</pre></td></tr>
++	<tr class="normal_line"><td><pre>         volumeMounts:</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - mountPath: /etc/config</pre></td></tr>
++	<tr class="normal_line"><td><pre>           name: config</pre></td></tr>
++	<tr class="normal_line"><td><pre>         - mountPath: /var/cache</pre></td></tr>
++	<tr class="normal_line"><td><pre>           name: cache</pre></td></tr>
++	<tr class="normal_line"><td><pre>       volumes:</pre></td></tr>
++</table>
++</div>
++
++</details>
++</div>
++
++<pre>_Stats_:
++[Applications: 2], [Full Run: Xs], [Rendering: Xs], [Cluster: Xs], [Argo CD: Xs]</pre>
++</div>
++</body>
++</html>
+diff --git a/integration-test/branch-22/target-2/output.md b/integration-test/branch-22/target-2/output.md
+new file mode 100644
+index 0000000..0b08d42
+--- /dev/null
++++ b/integration-test/branch-22/target-2/output.md
+@@ -0,0 +1,48 @@
++## Argo CD Diff Preview
++
++Summary:
++```yaml
++Modified (1):
++± ignore-array-order (+2|-2)
++```
++
++<details>
++<summary>ignore-array-order (examples/ignore-array-order/application.yaml)</summary>
++<br>
++
++#### Deployment: default/ignore-array-order
++```diff
++   selector:
++     matchLabels:
++       app: ignore-array-order
++   template:
++     metadata:
++       labels:
++         app: ignore-array-order
++     spec:
++       containers:
++       - args:
++-        - --first
++         - --second
+++        - --first
++         env:
++         - name: DB_HOST
++           value: postgres
++         - name: DB_PORT
++-          value: "5432"
+++          value: "5433"
++         - name: LOG_LEVEL
++           value: info
++         image: nginx:1.27
++         name: app
++         volumeMounts:
++         - mountPath: /etc/config
++           name: config
++         - mountPath: /var/cache
++           name: cache
++       volumes:
++```
++</details>
++
++_Stats_:
++[Applications: 2], [Full Run: Xs], [Rendering: Xs], [Cluster: Xs], [Argo CD: Xs]
+diff --git a/integration-test/integration_test.go b/integration-test/integration_test.go
+index 2506125..7e51a42 100644
+--- a/integration-test/integration_test.go
++++ b/integration-test/integration_test.go
+@@ -58,6 +58,7 @@ type TestCase struct {
+ 	IgnoreInvalidWatchPattern  string
+ 	HideDeletedAppDiff         string
+ 	IgnoreResources            string
++	IgnoreArrayOrder           string // --ignore-array-order (comma-separated JSONPaths)
+ 	ArgocdLoginOptions         string
+ 	ArgocdAuthToken            string // Auth token for Argo CD (if set, will be used instead of login)
+ 	RenderMethod               string // "cli", "server-api", "repo-server-api", or "" to use global flag
+@@ -68,6 +69,7 @@ type TestCase struct {
+ 	TraverseAppOfApps          string // If "true", enables recursive child app discovery (--traverse-app-of-apps)
+ 	IncludeHelmHooks           string // If "true", keeps helm.sh/hook resources in the output (--include-helm-hooks)
+ 	RepoRegex                  string // If set, use --repo-regex instead of --repo
++	GitHubRepo                 string // "owner/repo" to clone the test branches from (and pass as --repo); defaults to dag-andersen/argocd-diff-preview
+ 	ExpectFailure              bool   // If true, the test is expected to fail
+ }
+ 
+@@ -385,6 +387,31 @@ var testCases = []TestCase{
+ 		FileRegex:                  "examples/kind-level-capabilities/.*",
+ 		WatchIfNoWatchPatternFound: "false",
+ 	},
++	// Tests --ignore-array-order. The target branch reorders `env`, `volumes` and `args`
++	// of a Deployment and changes the value of one env var.
++	// target-1: without the option, all reorderings show up in the diff.
++	// target-2: with the option, only the env value change and the `args` reorder
++	// (not covered by the JSONPaths) remain.
++	// The test data lives in the quangkhainguyen/extended-argocd-diff-preview fork.
++	{
++		Name:                       "branch-22/target-1",
++		TargetBranch:               "integration-test/branch-22/target",
++		BaseBranch:                 "integration-test/branch-22/base",
++		Suffix:                     "-1",
++		GitHubRepo:                 "quangkhainguyen/extended-argocd-diff-preview",
++		FileRegex:                  "examples/ignore-array-order/.*",
++		WatchIfNoWatchPatternFound: "false",
++	},
++	{
++		Name:                       "branch-22/target-2",
++		TargetBranch:               "integration-test/branch-22/target",
++		BaseBranch:                 "integration-test/branch-22/base",
++		Suffix:                     "-2",
++		GitHubRepo:                 "quangkhainguyen/extended-argocd-diff-preview",
++		FileRegex:                  "examples/ignore-array-order/.*",
++		WatchIfNoWatchPatternFound: "false",
++		IgnoreArrayOrder:           ".spec.template.spec.containers[*].env,.spec.template.spec.volumes",
++	},
+ 	// This test verifies that disabling cluster roles without using the API fails.
+ 	// When createClusterRoles: false is set but --render-method=cli is used,
+ 	// the tool should fail because it can't access cluster resources via CLI.
+@@ -419,6 +446,14 @@ var testCases = []TestCase{
+ // effectiveRenderMethod returns the render mode that should be used for a test case.
+ // tc.RenderMethod takes highest precedence, then the global -render-method flag.
+ // Returns "" when the tool should use its own default (server-api).
++// gitHubRepo returns the "owner/repo" the test branches are cloned from.
++func gitHubRepo(tc TestCase) string {
++	if tc.GitHubRepo != "" {
++		return tc.GitHubRepo
++	}
++	return fmt.Sprintf("%s/%s", defaultGitHubOrg, defaultGitOpsRepo)
++}
++
+ func effectiveRenderMethod(tc TestCase) string {
+ 	if tc.RenderMethod != "" {
+ 		return tc.RenderMethod
+@@ -684,10 +719,10 @@ func runTestCase(t *testing.T, tc TestCase, createCluster bool) {
+ 	}
+ 
+ 	// Clone the repositories to the run directory
+-	if err := cloneBranch(tc.BaseBranch, runDirs.BaseBranch); err != nil {
++	if err := cloneBranch(gitHubRepo(tc), tc.BaseBranch, runDirs.BaseBranch); err != nil {
+ 		t.Fatalf("Failed to clone base branch: %v", err)
+ 	}
+-	if err := cloneBranch(tc.TargetBranch, runDirs.TargetBranch); err != nil {
++	if err := cloneBranch(gitHubRepo(tc), tc.TargetBranch, runDirs.TargetBranch); err != nil {
+ 		t.Fatalf("Failed to clone target branch: %v", err)
+ 	}
+ 
+@@ -749,12 +784,12 @@ func cleanup(dirs ...string) {
+ }
+ 
+ // cloneBranch clones a specific branch from the repository
+-func cloneBranch(branch, targetDir string) error {
++func cloneBranch(repo, branch, targetDir string) error {
+ 	if err := os.MkdirAll(targetDir, 0755); err != nil {
+ 		return fmt.Errorf("failed to create directory: %w", err)
+ 	}
+ 
+-	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", defaultGitHubOrg, defaultGitOpsRepo)
++	repoURL := fmt.Sprintf("https://github.com/%s.git", repo)
+ 
+ 	// Clone with depth=1, with retries for transient network errors
+ 	maxAttempts := 3
+@@ -972,7 +1007,7 @@ func runWithDocker(tc TestCase, createCluster bool, runDirs RunDirs) error {
+ 	if tc.RepoRegex != "" {
+ 		args = append(args, "-e", fmt.Sprintf("REPO_REGEX=%s", tc.RepoRegex))
+ 	} else {
+-		args = append(args, "-e", fmt.Sprintf("REPO=%s/%s", defaultGitHubOrg, defaultGitOpsRepo))
++		args = append(args, "-e", fmt.Sprintf("REPO=%s", gitHubRepo(tc)))
+ 	}
+ 	args = append(args, "-e", fmt.Sprintf("TIMEOUT=%s", defaultTimeout))
+ 	args = append(args, "-e", fmt.Sprintf("LINE_COUNT=%s", getLineCount(tc)))
+@@ -1008,6 +1043,9 @@ func runWithDocker(tc TestCase, createCluster bool, runDirs RunDirs) error {
+ 	if tc.IgnoreResources != "" {
+ 		args = append(args, "-e", fmt.Sprintf("IGNORE_RESOURCES=%s", tc.IgnoreResources))
+ 	}
++	if tc.IgnoreArrayOrder != "" {
++		args = append(args, "-e", fmt.Sprintf("IGNORE_ARRAY_ORDER=%s", tc.IgnoreArrayOrder))
++	}
+ 	if tc.KindOptions != "" {
+ 		args = append(args, "-e", fmt.Sprintf("KIND_OPTIONS=%s", tc.KindOptions))
+ 	}
+@@ -1080,7 +1118,7 @@ func buildArgs(tc TestCase, createCluster bool, runDirs RunDirs, repoRoot string
+ 	if tc.RepoRegex != "" {
+ 		args = append(args, "--repo-regex", tc.RepoRegex)
+ 	} else {
+-		args = append(args, "--repo", fmt.Sprintf("%s/%s", defaultGitHubOrg, defaultGitOpsRepo))
++		args = append(args, "--repo", gitHubRepo(tc))
+ 	}
+ 
+ 	// Don't keep cluster alive for tests that expect failure (cluster may be in broken state)
+@@ -1119,6 +1157,9 @@ func buildArgs(tc TestCase, createCluster bool, runDirs RunDirs, repoRoot string
+ 	if tc.IgnoreResources != "" {
+ 		args = append(args, "--ignore-resources", tc.IgnoreResources)
+ 	}
++	if tc.IgnoreArrayOrder != "" {
++		args = append(args, "--ignore-array-order", tc.IgnoreArrayOrder)
++	}
+ 	if tc.KindOptions != "" {
+ 		args = append(args, "--kind-options", tc.KindOptions)
+ 	}
+
+From 10b4ab0a369447ef5db379d5d5a93622a3465f2a Mon Sep 17 00:00:00 2001
+From: Quang Khai Nguyen <quang_khai.nguyen2@sbb.ch>
+Date: Mon, 26 Oct 2026 12:57:31 +0100
+Subject: [PATCH] fix: align ignored array entries in diffs
+
+
+diff --git a/pkg/arrayorder/arrayorder.go b/pkg/arrayorder/arrayorder.go
+index 3fafbe9..f6b1807 100644
+--- a/pkg/arrayorder/arrayorder.go
++++ b/pkg/arrayorder/arrayorder.go
+@@ -146,6 +146,152 @@ func Apply(obj map[string]any, rules []Rule) {
+ 	}
+ }
+ 
++// Align places identical elements of matched arrays in the same order on both
++// objects, leaving unmatched elements after them for a clearer resource diff.
++func Align(base, target map[string]any, rules []Rule) {
++	for _, rule := range rules {
++		align(base, target, rule.segments)
++	}
++}
++
++func align(base, target any, segments []segment) {
++	if len(segments) == 0 {
++		baseList, baseOK := base.([]any)
++		targetList, targetOK := target.([]any)
++		if baseOK && targetOK {
++			alignLists(baseList, targetList)
++		}
++		return
++	}
++
++	seg, rest := segments[0], segments[1:]
++	switch seg.kind {
++	case segField:
++		baseMap, baseOK := base.(map[string]any)
++		targetMap, targetOK := target.(map[string]any)
++		if !baseOK || !targetOK {
++			return
++		}
++		baseChild, baseOK := baseMap[seg.name]
++		targetChild, targetOK := targetMap[seg.name]
++		if baseOK && targetOK {
++			align(baseChild, targetChild, rest)
++		}
++	case segIndex:
++		baseList, baseOK := base.([]any)
++		targetList, targetOK := target.([]any)
++		if baseOK && targetOK && seg.index < len(baseList) && seg.index < len(targetList) {
++			align(baseList[seg.index], targetList[seg.index], rest)
++		}
++	case segWildcard:
++		switch baseValue := base.(type) {
++		case map[string]any:
++			targetValue, ok := target.(map[string]any)
++			if !ok {
++				return
++			}
++			for key, baseChild := range baseValue {
++				if targetChild, exists := targetValue[key]; exists {
++					align(baseChild, targetChild, rest)
++				}
++			}
++		case []any:
++			targetValue, ok := target.([]any)
++			if !ok {
++				return
++			}
++			for i := 0; i < len(baseValue) && i < len(targetValue); i++ {
++				align(baseValue[i], targetValue[i], rest)
++			}
++		}
++	case segRecursive:
++		alignRecursive(base, target, seg.name, rest)
++	}
++}
++
++func alignRecursive(base, target any, name string, rest []segment) {
++	switch baseValue := base.(type) {
++	case map[string]any:
++		targetValue, ok := target.(map[string]any)
++		if !ok {
++			return
++		}
++		if baseChild, exists := baseValue[name]; exists {
++			if targetChild, targetExists := targetValue[name]; targetExists {
++				align(baseChild, targetChild, rest)
++			}
++		}
++		for key, baseChild := range baseValue {
++			if targetChild, exists := targetValue[key]; exists {
++				alignRecursive(baseChild, targetChild, name, rest)
++			}
++		}
++	case []any:
++		targetValue, ok := target.([]any)
++		if !ok {
++			return
++		}
++		for i := 0; i < len(baseValue) && i < len(targetValue); i++ {
++			alignRecursive(baseValue[i], targetValue[i], name, rest)
++		}
++	}
++}
++
++func alignLists(base, target []any) {
++	baseGroups := groupByCanonicalKey(base)
++	targetGroups := groupByCanonicalKey(target)
++	if baseGroups == nil || targetGroups == nil {
++		return
++	}
++
++	commonCounts := make(map[string]int)
++	keys := make([]string, 0, len(baseGroups))
++	for key, baseItems := range baseGroups {
++		if targetItems := targetGroups[key]; len(targetItems) > 0 {
++			commonCounts[key] = min(len(baseItems), len(targetItems))
++			keys = append(keys, key)
++		}
++	}
++	sort.Strings(keys)
++
++	baseOrder := orderedByGroups(baseGroups, commonCounts, keys)
++	targetOrder := orderedByGroups(targetGroups, commonCounts, keys)
++	copy(base, baseOrder)
++	copy(target, targetOrder)
++}
++
++func groupByCanonicalKey(list []any) map[string][]any {
++	groups := make(map[string][]any, len(list))
++	for _, item := range list {
++		encoded, err := json.Marshal(item)
++		if err != nil {
++			return nil
++		}
++		key := string(encoded)
++		groups[key] = append(groups[key], item)
++	}
++	return groups
++}
++
++func orderedByGroups(groups map[string][]any, commonCounts map[string]int, commonKeys []string) []any {
++	ordered := make([]any, 0)
++	for _, key := range commonKeys {
++		ordered = append(ordered, groups[key][:commonCounts[key]]...)
++	}
++
++	var unmatchedKeys []string
++	for key, items := range groups {
++		if len(items) > commonCounts[key] {
++			unmatchedKeys = append(unmatchedKeys, key)
++		}
++	}
++	sort.Strings(unmatchedKeys)
++	for _, key := range unmatchedKeys {
++		ordered = append(ordered, groups[key][commonCounts[key]:]...)
++	}
++	return ordered
++}
++
+ func apply(node any, segments []segment) {
+ 	if len(segments) == 0 {
+ 		if list, ok := node.([]any); ok {
+diff --git a/pkg/diff/generator.go b/pkg/diff/generator.go
+index 52fd548..3baa48c 100644
+--- a/pkg/diff/generator.go
++++ b/pkg/diff/generator.go
+@@ -53,7 +53,7 @@ func GeneratePreview(
+ 	}
+ 
+ 	// Generate diffs using the matching package
+-	appDiffs, err := matching.GenerateAppDiffs(baseManifests, targetManifests, lineCount, diffIgnoreRegex, ignoreResourceRules)
++	appDiffs, err := matching.GenerateAppDiffsWithArrayOrder(baseManifests, targetManifests, lineCount, diffIgnoreRegex, ignoreResourceRules, ignoreArrayOrder)
+ 	if err != nil {
+ 		return time.Since(startTime), fmt.Errorf("failed to generate matching diffs: %w", err)
+ 	}
+diff --git a/pkg/diff/normalize_test.go b/pkg/diff/normalize_test.go
+index 60de2d2..9216fde 100644
+--- a/pkg/diff/normalize_test.go
++++ b/pkg/diff/normalize_test.go
+@@ -33,6 +33,25 @@ spec:
+ 	return unstructured.Unstructured{Object: obj}
+ }
+ 
++func deploymentWithVolumes(name string, volumes []any) unstructured.Unstructured {
++	return unstructured.Unstructured{Object: map[string]any{
++		"apiVersion": "apps/v1",
++		"kind":       "Deployment",
++		"metadata": map[string]any{
++			"name":      name,
++			"namespace": "default",
++		},
++		"spec": map[string]any{
++			"template": map[string]any{
++				"spec": map[string]any{
++					"containers": []any{map[string]any{"name": "app", "image": "nginx"}},
++					"volumes":    volumes,
++				},
++			},
++		},
++	}}
++}
++
+ func envNames(t *testing.T, m unstructured.Unstructured) []string {
+ 	t.Helper()
+ 	containers, _, err := unstructured.NestedSlice(m.Object, "spec", "template", "spec", "containers")
+@@ -110,3 +129,91 @@ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
+ 	assert.Contains(t, diffs[0].Resources[0].Content, `-          value: "2"`)
+ 	assert.Contains(t, diffs[0].Resources[0].Content, `+          value: "3"`)
+ }
++
++func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
++	rules, err := arrayorder.FromString(
++		".spec.template.spec.volumes,.spec.template.spec.volumes[*].projected.sources",
++	)
++	require.NoError(t, err)
++
++	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
++	roleConfig := map[string]any{
++		"name": "role-config-volume",
++		"configMap": map[string]any{"name": "default-role-config-cm"},
++	}
++	tokens := map[string]any{
++		"name": "tokens",
++		"projected": map[string]any{
++			"defaultMode": int64(420),
++			"sources": []any{map[string]any{
++				"serviceAccountToken": map[string]any{
++					"audience":          "api://AzureADTokenExchange",
++					"expirationSeconds": int64(3600),
++					"path":              "azure-identity-token",
++				},
++			}},
++		},
++	}
++
++	baseApps := []extract.ExtractedApp{{
++		Id: "app", Name: "app", SourcePath: "apps/app.yaml", Branch: git.Base,
++		Manifests: []unstructured.Unstructured{
++			deploymentWithVolumes("app-a", []any{diagnostics, roleConfig, tokens}),
++			deploymentWithVolumes("app-b", []any{roleConfig, diagnostics, tokens}),
++		},
++	}}
++	targetApps := []extract.ExtractedApp{{
++		Id: "app", Name: "app", SourcePath: "apps/app.yaml", Branch: git.Target,
++		Manifests: []unstructured.Unstructured{
++			deploymentWithVolumes("app-a", []any{tokens, diagnostics, roleConfig}),
++			deploymentWithVolumes("app-b", []any{diagnostics, tokens, roleConfig}),
++		},
++	}}
++
++	diffs, err := matching.GenerateAppDiffs(
++		sortArraysInApps(baseApps, rules),
++		sortArraysInApps(targetApps, rules),
++		3, nil, nil,
++	)
++	require.NoError(t, err)
++	assert.Empty(t, diffs)
++}
++
++func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testing.T) {
++	rules, err := arrayorder.FromString(".spec.template.spec.volumes")
++	require.NoError(t, err)
++
++	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
++	roleConfig := map[string]any{
++		"name":     "role-config-volume",
++		"configMap": map[string]any{"name": "default-role-config-cm"},
++	}
++	projectedToken := func(name string) map[string]any {
++		return map[string]any{
++			"name": name,
++			"projected": map[string]any{
++				"defaultMode": int64(420),
++				"sources": []any{map[string]any{
++					"serviceAccountToken": map[string]any{
++						"audience":          "api://AzureADTokenExchange",
++						"expirationSeconds": int64(3600),
++						"path":              "azure-identity-token",
++					},
++				}},
++			},
++		}
++	}
++
++	base := deploymentWithVolumes("app", []any{diagnostics, roleConfig, projectedToken("tokens")})
++	target := deploymentWithVolumes("app", []any{projectedToken("azure-identity-token"), diagnostics, roleConfig})
++	diffs, err := matching.GenerateAppDiffsWithArrayOrder(
++		sortArraysInApps(newApps(base, git.Base), rules),
++		sortArraysInApps(newApps(target, git.Target), rules),
++		3, nil, nil, rules,
++	)
++	require.NoError(t, err)
++	require.Len(t, diffs, 1)
++	require.Len(t, diffs[0].Resources, 1)
++	assert.Equal(t, 1, diffs[0].Resources[0].DeletedLines, diffs[0].Resources[0].Content)
++	assert.Equal(t, 1, diffs[0].Resources[0].AddedLines, diffs[0].Resources[0].Content)
++}
+diff --git a/pkg/matching/diff.go b/pkg/matching/diff.go
+index 2532008..5b03898 100644
+--- a/pkg/matching/diff.go
++++ b/pkg/matching/diff.go
+@@ -19,7 +19,7 @@ type DiffResult struct {
+ // For deleted resources (Target is nil), shows all lines as deletions.
+ // For modified resources, shows a unified diff with context.
+ func (rp *ResourcePair) Diff(contextLines uint) (DiffResult, error) {
+-	return generateResourceDiff(*rp, contextLines, nil)
++	return generateResourceDiff(*rp, contextLines, nil, nil)
+ }
+ 
+ // resourceToYAML converts an unstructured resource to YAML string.
+diff --git a/pkg/matching/output.go b/pkg/matching/output.go
+index 891372d..02e83f3 100644
+--- a/pkg/matching/output.go
++++ b/pkg/matching/output.go
+@@ -7,6 +7,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/dag-andersen/argocd-diff-preview/pkg/arrayorder"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/extract"
+ 	"github.com/dag-andersen/argocd-diff-preview/pkg/resource_filter"
+ 	"github.com/go-git/go-git/v5/utils/diff"
+@@ -168,6 +169,18 @@ func GenerateAppDiffs(
+ 	contextLines uint,
+ 	ignorePattern *string,
+ 	ignoreResourceRules []resource_filter.IgnoreResourceRule,
++) ([]AppDiff, error) {
++	return GenerateAppDiffsWithArrayOrder(baseApps, targetApps, contextLines, ignorePattern, ignoreResourceRules, nil)
++}
++
++// GenerateAppDiffsWithArrayOrder generates diffs and aligns selected arrays in
++// matched resources so unchanged elements remain stable in the rendered diff.
++func GenerateAppDiffsWithArrayOrder(
++	baseApps, targetApps []extract.ExtractedApp,
++	contextLines uint,
++	ignorePattern *string,
++	ignoreResourceRules []resource_filter.IgnoreResourceRule,
++	ignoreArrayOrder []arrayorder.Rule,
+ ) ([]AppDiff, error) {
+ 	// Compile the ignore pattern regex once up front
+ 	var compiledIgnorePattern *regexp.Regexp
+@@ -186,7 +199,7 @@ func GenerateAppDiffs(
+ 	var diffs []AppDiff
+ 
+ 	for _, pair := range pairs {
+-		appDiff, err := generateAppDiff(pair, contextLines, compiledIgnorePattern, ignoreResourceRules)
++		appDiff, err := generateAppDiff(pair, contextLines, compiledIgnorePattern, ignoreResourceRules, ignoreArrayOrder)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to generate diff for app pair: %w", err)
+ 		}
+@@ -215,7 +228,7 @@ func GenerateAppDiffs(
+ }
+ 
+ // generateAppDiff generates the diff for a single app pair
+-func generateAppDiff(pair Pair, contextLines uint, ignorePattern *regexp.Regexp, ignoreResourceRules []resource_filter.IgnoreResourceRule) (AppDiff, error) {
++func generateAppDiff(pair Pair, contextLines uint, ignorePattern *regexp.Regexp, ignoreResourceRules []resource_filter.IgnoreResourceRule, ignoreArrayOrder []arrayorder.Rule) (AppDiff, error) {
+ 	diff := AppDiff{}
+ 
+ 	// Set names and paths
+@@ -259,7 +272,7 @@ func generateAppDiff(pair Pair, contextLines uint, ignorePattern *regexp.Regexp,
+ 	}
+ 
+ 	// Build per-resource diffs
+-	resources, added, deleted, err := buildResourceDiffs(changedResources, contextLines, ignorePattern, ignoreResourceRules)
++	resources, added, deleted, err := buildResourceDiffsWithArrayOrder(changedResources, contextLines, ignorePattern, ignoreResourceRules, ignoreArrayOrder)
+ 	if err != nil {
+ 		return diff, err
+ 	}
+@@ -283,6 +296,16 @@ func buildResourceDiffs(
+ 	contextLines uint,
+ 	ignorePattern *regexp.Regexp,
+ 	ignoreResourceRules []resource_filter.IgnoreResourceRule,
++) ([]ResourceDiff, int, int, error) {
++	return buildResourceDiffsWithArrayOrder(resources, contextLines, ignorePattern, ignoreResourceRules, nil)
++}
++
++func buildResourceDiffsWithArrayOrder(
++	resources []ResourcePair,
++	contextLines uint,
++	ignorePattern *regexp.Regexp,
++	ignoreResourceRules []resource_filter.IgnoreResourceRule,
++	ignoreArrayOrder []arrayorder.Rule,
+ ) ([]ResourceDiff, int, int, error) {
+ 	var result []ResourceDiff
+ 	totalAdded := 0
+@@ -342,7 +365,7 @@ func buildResourceDiffs(
+ 		}
+ 
+ 		// Generate diff for this resource pair
+-		diffResult, err := generateResourceDiff(rp, contextLines, ignorePattern)
++		diffResult, err := generateResourceDiff(rp, contextLines, ignorePattern, ignoreArrayOrder)
+ 		if err != nil {
+ 			return nil, 0, 0, err
+ 		}
+@@ -368,7 +391,15 @@ func buildResourceDiffs(
+ }
+ 
+ // generateResourceDiff generates diff for a single resource pair with ignore pattern support
+-func generateResourceDiff(rp ResourcePair, contextLines uint, ignorePattern *regexp.Regexp) (DiffResult, error) {
++func generateResourceDiff(rp ResourcePair, contextLines uint, ignorePattern *regexp.Regexp, ignoreArrayOrder []arrayorder.Rule) (DiffResult, error) {
++	if rp.Base != nil && rp.Target != nil && len(ignoreArrayOrder) > 0 {
++		base := rp.Base.DeepCopy()
++		target := rp.Target.DeepCopy()
++		arrayorder.Align(base.Object, target.Object, ignoreArrayOrder)
++		rp.Base = base
++		rp.Target = target
++	}
++
+ 	baseYAML, err := resourceToYAML(rp.Base)
+ 	if err != nil {
+ 		return DiffResult{}, fmt.Errorf("failed to marshal base resource: %w", err)
