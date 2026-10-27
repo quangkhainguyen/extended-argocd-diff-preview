@@ -1,0 +1,236 @@
+From 3eacef09be6a3362fe9f0f0846156962306de7ac Mon Sep 17 00:00:00 2001
+From: Quang Khai Nguyen <quang_khai.nguyen2@sbb.ch>
+Date: Tue, 27 Oct 2026 10:02:05 +0100
+Subject: [PATCH] feat: support root JSONPath filters in ignore-array-order
+
+- add string equality filters for manifest fields such as kind
+- apply filters during array sorting and diff alignment
+- add regression tests and document supported filter syntax
+---
+ docs/filter-output.md             |  6 +++-
+ pkg/arrayorder/arrayorder.go      | 32 +++++++++++++++++++++
+ pkg/arrayorder/arrayorder_test.go | 48 ++++++++++++++++++++++++++++++-
+ pkg/diff/normalize_test.go        |  8 +++---
+ 4 files changed, 88 insertions(+), 6 deletions(-)
+
+diff --git a/docs/filter-output.md b/docs/filter-output.md
+index 010e8da..4b228b4 100644
+--- a/docs/filter-output.md
++++ b/docs/filter-output.md
+@@ -72,6 +72,9 @@ Reordering list entries (e.g. environment variables after refactoring a Helm tem
+ # Environment variables of all containers in Deployments, StatefulSets, DaemonSets, Jobs, ...
+ argocd-diff-preview --ignore-array-order='.spec.template.spec.containers[*].env'
+ 
++# Environment variables of Deployments only
++argocd-diff-preview --ignore-array-order="\$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env"
++
+ # Environment variables of any container type, at any depth (also Pods, CronJobs, CRDs)
+ argocd-diff-preview --ignore-array-order='..containers[*].env,..initContainers[*].env'
+ 
+@@ -88,8 +91,9 @@ Supported JSONPath syntax (a subset of [kubectl JSONPath](https://kubernetes.io/
+ | `[*]` / `.*`   | All array elements / all map values                      |
+ | `[n]`          | Array element at index `n`                               |
+ | `['a.b/c']`    | Field whose name contains special characters             |
++| `[?(@.kind == 'Deployment')]` | Root manifest string-field equality filter |
+ 
+-A leading `$` and kubectl-style braces (`{.spec...}`) are accepted. Filter expressions (`[?(...)]`), slices and unions are not supported. Paths that don't match anything in a resource are ignored.
++A leading `$` and kubectl-style braces (`{.spec...}`) are accepted. A root filter tests the current manifest, not an array of manifests. It supports `==` on a direct string field (such as `kind` or `apiVersion`), with single- or double-quoted string values. Nested filters, other operators, compound conditions, slices and unions are not supported. Paths that don't match anything in a resource are ignored.
+ 
+ Real changes (added, removed or modified elements) are still shown. The sorting only affects the diff - files written with `--output-app-manifests` or `--output-branch-manifests` keep the original order.
+ 
+diff --git a/pkg/arrayorder/arrayorder.go b/pkg/arrayorder/arrayorder.go
+index f6b1807..5d7a595 100644
+--- a/pkg/arrayorder/arrayorder.go
++++ b/pkg/arrayorder/arrayorder.go
+@@ -3,6 +3,7 @@ package arrayorder
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"regexp"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -18,6 +19,7 @@ import (
+ //	.*  / [*]      all map values / all array elements
+ //	[n]            array element n
+ //	['a.b']        child field whose name contains special characters
++//	[?(@.kind == 'Deployment')] root string-field equality filter
+ //
+ // The path may optionally be prefixed with "$" or wrapped in "{...}".
+ type Rule struct {
+@@ -32,14 +34,18 @@ const (
+ 	segWildcard
+ 	segIndex
+ 	segRecursive
++	segRootFilter
+ )
+ 
+ type segment struct {
+ 	kind  segmentKind
+ 	name  string
+ 	index int
++	value string
+ }
+ 
++var rootFilterPattern = regexp.MustCompile(`^\[\?\(\s*@\.([A-Za-z_][A-Za-z0-9_]*)\s*==\s*(?:'([^']*)'|"([^"]*)")\s*\)\]`)
++
+ func (r Rule) String() string {
+ 	return r.raw
+ }
+@@ -105,6 +111,15 @@ func Parse(raw string) (Rule, error) {
+ 			}
+ 			i = next
+ 		case p[i] == '[':
++			if strings.HasPrefix(p[i:], "[?") {
++				match := rootFilterPattern.FindStringSubmatch(p[i:])
++				if len(segments) != 0 || match == nil {
++					return fail("unsupported filter: use a root string equality filter such as $[?(@.kind == 'Deployment')]")
++				}
++				segments = append(segments, segment{kind: segRootFilter, name: match[1], value: match[2] + match[3]})
++				i += len(match[0])
++				continue
++			}
+ 			end := strings.IndexByte(p[i:], ']')
+ 			if end < 0 {
+ 				return fail("unclosed '['")
+@@ -166,6 +181,10 @@ func align(base, target any, segments []segment) {
+ 
+ 	seg, rest := segments[0], segments[1:]
+ 	switch seg.kind {
++	case segRootFilter:
++		if matchesRootFilter(base, seg) && matchesRootFilter(target, seg) {
++			align(base, target, rest)
++		}
+ 	case segField:
+ 		baseMap, baseOK := base.(map[string]any)
+ 		targetMap, targetOK := target.(map[string]any)
+@@ -302,6 +321,10 @@ func apply(node any, segments []segment) {
+ 
+ 	seg, rest := segments[0], segments[1:]
+ 	switch seg.kind {
++	case segRootFilter:
++		if matchesRootFilter(node, seg) {
++			apply(node, rest)
++		}
+ 	case segField:
+ 		if m, ok := node.(map[string]any); ok {
+ 			if child, ok := m[seg.name]; ok {
+@@ -328,6 +351,15 @@ func apply(node any, segments []segment) {
+ 	}
+ }
+ 
++func matchesRootFilter(node any, filter segment) bool {
++	obj, ok := node.(map[string]any)
++	if !ok {
++		return false
++	}
++	value, ok := obj[filter.name].(string)
++	return ok && value == filter.value
++}
++
+ func applyRecursive(node any, name string, rest []segment) {
+ 	switch v := node.(type) {
+ 	case map[string]any:
+diff --git a/pkg/arrayorder/arrayorder_test.go b/pkg/arrayorder/arrayorder_test.go
+index 12b4c14..7399dd1 100644
+--- a/pkg/arrayorder/arrayorder_test.go
++++ b/pkg/arrayorder/arrayorder_test.go
+@@ -67,7 +67,9 @@ func TestFromString(t *testing.T) {
+ 		{name: "no leading dot", input: "spec.volumes", want: []string{"spec.volumes"}},
+ 		{name: "quoted field", input: ".metadata.annotations['a.b/c']", want: []string{".metadata.annotations['a.b/c']"}},
+ 		{name: "unclosed bracket", input: ".spec.containers[*", wantErr: "unclosed"},
+-		{name: "filter not supported", input: ".spec.containers[?(@.name=='a')]", wantErr: "unsupported bracket"},
++		{name: "nested filter not supported", input: ".spec.containers[?(@.name=='a')]", wantErr: "unsupported filter"},
++		{name: "unsupported filter operator", input: "$[?(@.kind != 'Deployment')].spec", wantErr: "unsupported filter"},
++		{name: "unsupported compound filter", input: "$[?(@.kind == 'Deployment' || @.kind == 'Pod')].spec", wantErr: "unsupported filter"},
+ 		{name: "empty field", input: ".spec..", wantErr: "recursive descent"},
+ 		{name: "missing field name", input: ".spec.[*]", wantErr: "missing field name"},
+ 	}
+@@ -176,3 +178,47 @@ list:
+ 	Apply(b, rules)
+ 	assert.Equal(t, toYAML(t, a), toYAML(t, b))
+ }
++
++func TestApply_RootKindFilter(t *testing.T) {
++	for _, expression := range []string{
++		`$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env`,
++		`$[?(@.kind=="Deployment")].spec.template.spec.containers[*].env`,
++	} {
++		t.Run(expression, func(t *testing.T) {
++			rules := mustRules(t, expression)
++			for _, kind := range []string{"Deployment", "StatefulSet", ""} {
++				t.Run(kind, func(t *testing.T) {
++					obj := parseYAML(t, deployment)
++					if kind == "" {
++						delete(obj, "kind")
++					} else {
++						obj["kind"] = kind
++					}
++					expected := parseYAML(t, toYAML(t, obj))
++					if kind == "Deployment" {
++						Apply(expected, mustRules(t, ".spec.template.spec.containers[*].env"))
++					}
++					Apply(obj, rules)
++					assert.Equal(t, expected, obj)
++				})
++			}
++		})
++	}
++}
++
++func TestAlign_RootKindFilter(t *testing.T) {
++	rules := mustRules(t, `$[?(@.kind == 'Deployment')].list`)
++	for _, kind := range []string{"Deployment", "StatefulSet"} {
++		t.Run(kind, func(t *testing.T) {
++			base := map[string]any{"kind": kind, "list": []any{"a", "b"}}
++			target := map[string]any{"kind": kind, "list": []any{"b", "c"}}
++			Align(base, target, rules)
++			if kind == "Deployment" {
++				assert.Equal(t, []any{"b", "a"}, base["list"])
++			} else {
++				assert.Equal(t, []any{"a", "b"}, base["list"])
++			}
++			assert.Equal(t, []any{"b", "c"}, target["list"])
++		})
++	}
++}
+diff --git a/pkg/diff/normalize_test.go b/pkg/diff/normalize_test.go
+index 9216fde..b3bddc1 100644
+--- a/pkg/diff/normalize_test.go
++++ b/pkg/diff/normalize_test.go
+@@ -83,7 +83,7 @@ func TestSortArraysInApps_DoesNotMutateInput(t *testing.T) {
+ }
+ 
+ func TestIgnoreArrayOrder_EndToEndDiff(t *testing.T) {
+-	rules, err := arrayorder.FromString(".spec.template.spec.containers[*].env")
++	rules, err := arrayorder.FromString(`$[?(@.kind == 'Deployment')].spec.template.spec.containers[*].env`)
+ 	require.NoError(t, err)
+ 
+ 	base := deploymentWithEnv(t, `
+@@ -138,7 +138,7 @@ func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
+ 
+ 	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
+ 	roleConfig := map[string]any{
+-		"name": "role-config-volume",
++		"name":      "role-config-volume",
+ 		"configMap": map[string]any{"name": "default-role-config-cm"},
+ 	}
+ 	tokens := map[string]any{
+@@ -180,12 +180,12 @@ func TestIgnoreArrayOrder_ReorderedVolumesInTwoDeployments(t *testing.T) {
+ }
+ 
+ func TestIgnoreArrayOrder_DoesNotReportUnchangedVolumesWhenOneIsRenamed(t *testing.T) {
+-	rules, err := arrayorder.FromString(".spec.template.spec.volumes")
++	rules, err := arrayorder.FromString(`$[?(@.kind == 'Deployment')].spec.template.spec.volumes`)
+ 	require.NoError(t, err)
+ 
+ 	diagnostics := map[string]any{"name": "diagnostics", "emptyDir": map[string]any{}}
+ 	roleConfig := map[string]any{
+-		"name":     "role-config-volume",
++		"name":      "role-config-volume",
+ 		"configMap": map[string]any{"name": "default-role-config-cm"},
+ 	}
+ 	projectedToken := func(name string) map[string]any {
+-- 
+2.53.0
+
